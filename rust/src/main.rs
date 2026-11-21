@@ -35,7 +35,7 @@ use std::time::Instant;
 const NP: usize = 256;
 /// Profiling probes: how many times to run (parse, dedup+clicks, sweep).
 /// Always (1, 1, 1) in a real build.
-const PROBE: (usize, usize, usize) = (1, 1, 1);
+const PROBE: (usize, usize, usize) = (1, 1, 2);
 const GAP: u32 = 1_800_000;
 const WEEK: i64 = 604_800_000;
 const CHUNK: usize = 4 << 20;
