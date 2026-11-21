@@ -1,25 +1,25 @@
-# Shopping Sessions: DuckDB pipeline (team Ardere)
+# Shopping Sessions (team Ardere)
 
-An exact implementation of `rules.md` for the Builders Buildathon *Shopping Sessions* track. It turns the click-stream CSVs in `$DATA_DIR` into `user_daily/` and `campaign_daily/` Parquet tables in `$OUTPUT_DIR`. All the heavy work runs in DuckDB SQL. Python orchestrates; numpy does the linked-ID grouping and sessionizing.
+An exact implementation of `rules.md` for the Builders Buildathon *Shopping Sessions* track: click-stream CSVs in `$DATA_DIR` become `user_daily/` and `campaign_daily/` Parquet tables in `$OUTPUT_DIR`.
 
-## Pipeline (`pipeline/`)
+The submitted image runs a single native binary (`rust/`). The earlier DuckDB implementation (`pipeline/`) stays in the repo as the reference it is tested against.
 
-| Stage | File | What it does |
-|---|---|---|
-| parse | `common.py` | CSV dialect: a fast native DuckDB reader with quoting off; files containing `\r` fall back to an exact `read_text` parser |
-| timestamps | `timestamps.py` | All 3 `ts` forms: one regex + the native TIMESTAMP cast (hour 24 rejected explicitly) |
-| links | `links.py` | Parse links, drop empty sides |
-| events | `events.py` | Validate each copy → dedup on `event_id` (integer-hash prefilter, earliest `ingest_ts`) → drop late → compact to `(user, t, price, cat)` |
-| clicks | `clicks.py` | Dedup on `click_id`, validate against the window and `campaigns.csv` |
-| encode | `encode.py` | One user-ID dictionary, numbered in byte-wise order, so the smallest uid is the person's name |
-| people | `people.py` | Connected components over links (vectorized numpy union-find) |
-| sessions | `sessions.py` | One sort of packed (person, time) keys in numpy; a new session where the gap > 30 min |
-| outputs | `outputs.py` | ASOF-join credit (ties → smallest `click_id`), assists via merged click islands, both tables |
+## Rust pipeline (`rust/src/`)
 
-`pipeline.py` runs the stages and prints per-stage timings to stderr.
+Every phase runs on all cores with no locks. Records stay as slices into memory-mapped files, so no strings are copied.
+
+| Phase | What it does |
+|---|---|
+| parse | mmap every CSV, split it into 4 MB chunks on line boundaries, parse the exact dialect byte by byte (`parse.rs`). Each event copy is validated and compacted to a fixed-size record: hash, 32-bit time offset, price and category packed into 32 bits |
+| dedup | copies are radix-partitioned into 256 buckets by `hash(event_id)`. Each bucket is deduplicated in its own small hash table (earliest `ingest_ts` wins, before validation), then the late check runs |
+| clicks, links | parsed in parallel. Clicks need no dedup: copies are identical, so they cannot change a credit or an assist |
+| intern | user IDs → dense integer ids, per bucket |
+| people | union-find over links; a person is named by their byte-wise smallest ID |
+| sweep | events and clicks are partitioned by person and sorted by `(person << 32) \| time` keys. One pass per person yields sessions, `user_daily` rows, the credit (latest click within 7 days, ties → smallest `click_id`) and the assists (a sliding 7-day set of active campaigns) |
+| write | Parquet through the low-level column writer, one file per thread |
 
 ## Testing
 
 - `make fixtures`: the 36 edge-case fixtures, run in the image with scorer flags
 - `make dev && make run-dev && make check-dev`: the 1M-event dev set against `dev-answer/`
-- Without Docker: `python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py`
+- `cargo test --release` in `rust/`: unit tests for the timestamp and CSV edge cases
