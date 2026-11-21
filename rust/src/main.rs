@@ -219,8 +219,7 @@ fn map_file(p: &Path) -> Option<Mmap> {
     if f.metadata().ok()?.len() == 0 {
         return None;
     }
-    // populate: map every page up front in one call instead of one fault per page
-    let m = unsafe { memmap2::MmapOptions::new().populate().map(&f).ok()? };
+    let m = unsafe { Mmap::map(&f).ok()? };
     #[cfg(unix)]
     let _ = m.advise(memmap2::Advice::Sequential);
     Some(m)
@@ -243,6 +242,22 @@ fn map_dir(dir: &Path, nt: usize) -> Vec<Mmap> {
     let mut all: Vec<(usize, Mmap)> = got.into_iter().flatten().collect();
     all.sort_unstable_by_key(|x| x.0);
     all.into_iter().map(|x| x.1).collect()
+}
+
+/// Map a chunk's pages in one call (MADV_POPULATE_READ) just before it is
+/// parsed, instead of one page fault per page. A no-op where unsupported.
+fn populate(c: &[u8]) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        let a = c.as_ptr() as usize & !4095;
+        let b = c.as_ptr() as usize + c.len();
+        unsafe { madvise(a as *mut std::ffi::c_void, b - a, 22) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = c;
 }
 
 /// Data part of a file (after its header line).
@@ -335,9 +350,13 @@ struct Sweep {
 fn main() {
     let t0 = Instant::now();
     let mut last = Instant::now();
+    let stop_after = std::env::var("SS_STOP").unwrap_or_default();
     let mut lap = |name: &str| {
         eprintln!("{name:<10}{:7.3}s  {}", last.elapsed().as_secs_f64(), proc_stat());
         last = Instant::now();
+        if stop_after == name {
+            std::process::exit(0); // profiling: cost of the phases so far
+        }
     };
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
@@ -364,17 +383,42 @@ fn main() {
             }
         });
     }
-    let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
-    cat_names.push(b"unknown");
-    cat_names.sort_unstable();
-    cat_names.dedup();
-    assert!(cat_names.len() <= 256, "too many categories");
-    let cat_code = |c: &[u8]| cat_names.binary_search(&c).unwrap() as u32;
-    let unknown = cat_code(b"unknown");
-    let mut prod: Map<Key, u32> = Map::default();
-    for (p, c) in &prod_rows {
-        prod.insert(Key::new(p), cat_code(c));
+    // distinct names first (a handful), then their byte-wise order
+    let mut uniq: Map<Key, ()> = Map::default();
+    uniq.insert(Key::new(b"unknown"), ());
+    for r in &prod_rows {
+        uniq.insert(Key::new(r.1), ());
     }
+    let mut cat_names: Vec<&[u8]> = uniq.keys().map(|k| k.b).collect();
+    cat_names.sort_unstable();
+    assert!(cat_names.len() <= 256, "too many categories");
+    let cat_of: Map<Key, u32> = cat_names.iter().enumerate().map(|(i, c)| (Key::new(c), i as u32)).collect();
+    let unknown = cat_of[&Key::new(b"unknown")];
+    // product -> category: packed product codes in an open-addressing table,
+    // other product IDs in a map; a later row for the same product wins
+    let mut prod: Table<u32> = Table::new(prod_rows.len() + 16);
+    let mut prod_other: Map<Key, u32> = Map::default();
+    let mut last_cat: (&[u8], u32) = (b"", u32::MAX);
+    for (p, c) in &prod_rows {
+        if last_cat.0 != *c || last_cat.1 == u32::MAX {
+            last_cat = (c, cat_of[&Key::new(c)]);
+        }
+        match pack_id(p) {
+            Some(k) => {
+                let (i, _) = prod.slot(k);
+                prod.set(i, k, last_cat.1);
+            }
+            None => {
+                prod_other.insert(Key::new(p), last_cat.1);
+            }
+        }
+    }
+    let prod_cat = |p: &[u8]| -> u32 {
+        match pack_id(p) {
+            Some(k) => prod.get(k).unwrap_or(unknown),
+            None => prod_other.get(&Key::new(p)).copied().unwrap_or(unknown),
+        }
+    };
 
     // ---- campaigns
     let camp_map = map_file(&data.join("campaigns.csv"));
@@ -419,6 +463,7 @@ fn main() {
             r
         });
         let copies = par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
+            populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
                     return;
@@ -433,7 +478,7 @@ fn main() {
                                 1 => true,
                                 2 => match price(pr) {
                                     Some(p) => {
-                                        let cat = prod.get(&Key::new(pr_id)).copied().unwrap_or(unknown);
+                                        let cat = prod_cat(pr_id);
                                         c.pay = (p << 8) | cat;
                                         true
                                     }
@@ -537,6 +582,7 @@ fn main() {
                     }
                     pend.clear();
                 };
+                populate(ck_chunks[task - NP]);
                 for_each_record::<4>(ck_chunks[task - NP], |[cid, user, cmp, ts]| {
                     if cid.is_empty() || user.is_empty() {
                         return;
@@ -556,7 +602,8 @@ fn main() {
             }
         },
     );
-    drop(ev_parts);
+    // freeing ~0.7 GB unmaps every page: let a background thread do it
+    std::thread::spawn(move || drop(ev_parts));
     let mut evs = Vec::with_capacity(work.len());
     let mut cks = Vec::with_capacity(work.len());
     for wk in work {
@@ -727,8 +774,7 @@ fn main() {
             st.ck = ck;
         },
     );
-    drop(evs);
-    drop(cks);
+    std::thread::spawn(move || drop((evs, cks)));
     lap("sweep");
 
     // ---- outputs
@@ -826,6 +872,8 @@ fn main() {
     );
     lap("write");
     eprintln!("{:<10}{:7.3}s  ({} threads)", "total", t0.elapsed().as_secs_f64(), nt);
+    // outputs are written and closed; skip freeing everything else
+    std::process::exit(0);
 }
 
 /// Event type: 1 = view or cart, 2 = purchase, 0 = anything else.
@@ -886,7 +934,8 @@ fn group_sort<T: Copy>(src: &[&[T]], out: &mut Vec<T>, bins: &mut Vec<u16>, bits
     for i in 0..nb {
         let (a, b) = (start[i] as usize, start[i + 1] as usize);
         if b - a > 1 {
-            out[a..b].sort_unstable_by_key(|x| (p(x), t(x)));
+            let g = &mut out[a..b];
+            g.sort_unstable_by_key(|x| (p(x), t(x)));
         }
     }
 }

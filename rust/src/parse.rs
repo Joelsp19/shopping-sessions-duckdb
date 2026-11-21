@@ -112,6 +112,86 @@ pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
     }
 }
 
+/// Every well-formed line of a chunk as exactly N unquoted fields: the same
+/// results as `fields` on each '\n'-separated line (malformed lines skipped).
+///
+/// Field at a time: 32 bytes are loaded at the field's start and the first
+/// ',', '\n' or '"' found with one compare. A plain field must end at its
+/// separator; a field opening with '"' must close at the first special byte
+/// with '"' and be followed by its separator. Any line that does not fit (a
+/// field over 31 bytes, quotes inside, wrong field count) goes to `fields`.
+#[inline]
+pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let len = chunk.len();
+        let ptr = chunk.as_ptr();
+        let mut start = 0usize;
+        // fast path while every window of the line is surely inside the chunk
+        while start + 33 * N + 32 <= len {
+            let mut out: [&'a [u8]; N] = [&chunk[..0]; N];
+            let mut s = start;
+            let mut ok = 1u32;
+            // One field: (ok bit, first byte, length, next field's start).
+            // Bit 32 caps the search: a field reaching it is valid only if its
+            // separator sits exactly there.
+            #[inline(always)]
+            unsafe fn field(ptr: *const u8, s: usize, want: u8) -> (u32, usize, usize, usize) {
+                let v = _mm256_loadu_si256(ptr.add(s) as *const __m256i);
+                let qv = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8));
+                let sv = _mm256_or_si256(
+                    _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8)),
+                    _mm256_cmpeq_epi8(v, _mm256_set1_epi8(10)),
+                );
+                let qm = opaque(_mm256_movemask_epi8(qv) as u32 as u64);
+                let m = opaque(_mm256_movemask_epi8(_mm256_or_si256(qv, sv)) as u32 as u64) | (1 << 32);
+                let q0 = (qm & 1) as usize;
+                let pos = (m & !(q0 as u64)).trailing_zeros() as usize; // 1..=32 if quoted
+                let closing = ((qm >> pos) & 1) as usize; // bit 32 of qm is 0
+                let ok = (*ptr.add(s + pos + q0) == want) as u32 & (q0 <= closing) as u32;
+                (ok, s + q0, pos - q0, s + pos + q0 + 1)
+            }
+            for k in 0..N - 1 {
+                let (o, a, l, nx) = unsafe { field(ptr, s, b',') };
+                ok &= o;
+                out[k] = unsafe { std::slice::from_raw_parts(ptr.add(a), l) };
+                s = nx;
+            }
+            {
+                let (o, a, l, nx) = unsafe { field(ptr, s, 10) };
+                ok &= o;
+                out[N - 1] = unsafe { std::slice::from_raw_parts(ptr.add(a), l) };
+                s = nx;
+            }
+            if ok != 0 {
+                f(out);
+                start = s;
+            } else {
+                // reference splitter for this one line
+                let end = match memchr(b'\n', &chunk[start..]) {
+                    Some(i) => start + i,
+                    None => len,
+                };
+                if let Some(r) = fields::<N>(&chunk[start..end]) {
+                    f(r);
+                }
+                start = end + 1;
+            }
+        }
+        if start < len {
+            for_each_line(&chunk[start..], |l| {
+                if let Some(r) = fields::<N>(l) {
+                    f(r);
+                }
+            });
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for_each_record_v3(chunk, f)
+}
+
 /// Every well-formed line of a chunk as exactly N unquoted fields (the same
 /// rules as `fields`), found with one SIMD pass over the chunk instead of a
 /// search per field. Malformed lines (wrong field count, bad quoting, empty)
@@ -124,7 +204,7 @@ pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
 /// is well formed when exactly N-1 commas lie before its newline; quotes are
 /// counted once per line from the blocks' quote masks.
 #[inline]
-pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+pub fn for_each_record_v3<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     const B: usize = 16; // blocks per batch
     let len = chunk.len();
     assert!(len < (u32::MAX - 64) as usize, "chunk too large");
@@ -951,7 +1031,12 @@ mod tests {
         let mut x: u64 = 0x1234_5678;
         for len in [0usize, 1, 63, 64, 65, 500, 5000, 40000] {
             for rep in 0..20 {
-                let alpha: &[u8] = if rep % 2 == 0 { b"ab,\"\n\r" } else { b"abcdefgh,,\"\n" };
+                let alpha: &[u8] = match rep % 4 {
+                    0 => b"ab,\"\n\r",
+                    1 => b"abcdefgh,,\"\n",
+                    2 => b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ,\n\"",
+                    _ => b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,\",\"\n",
+                };
                 let text: Vec<u8> = (0..len)
                     .map(|_| {
                         x ^= x << 13;
@@ -972,6 +1057,58 @@ mod tests {
                 assert_eq!(got, want, "len {len} rep {rep}");
             }
         }
+        // structured lines: realistic and edge-case fields, every field count
+        let mut x: u64 = 0xDEAD_BEEF;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut text = Vec::new();
+        for _ in 0..30000 {
+            let nf = match rnd() % 10 {
+                0 => 6,
+                1 => 8,
+                _ => 7,
+            };
+            for k in 0..nf {
+                if k > 0 {
+                    text.push(b',');
+                }
+                let r = rnd();
+                let body: Vec<u8> = match r % 9 {
+                    0 => Vec::new(),
+                    1 => b"u9wteausv".to_vec(),
+                    2 => b"2026-09-16T18:24:20Z".to_vec(),
+                    3 => vec![b'a'; (29 + (r >> 8) % 7) as usize], // 29..=35 bytes
+                    4 => b"a\"b".to_vec(),
+                    5 => b"x,y".to_vec(),
+                    6 => b"\r".to_vec(),
+                    7 => vec![b'z'; (r >> 8) as usize % 40],
+                    _ => b"1789316537000".to_vec(),
+                };
+                match (r >> 20) % 4 {
+                    0 => {
+                        text.push(b'"');
+                        text.extend_from_slice(&body);
+                        text.push(b'"');
+                    }
+                    1 if r % 31 == 0 => {
+                        text.push(b'"');
+                        text.extend_from_slice(&body);
+                    }
+                    _ => text.extend_from_slice(&body),
+                }
+            }
+            text.push(b'\n');
+        }
+        let mut want: Vec<[&[u8]; 7]> = Vec::new();
+        for_each_line(&text, |l| want.extend(fields::<7>(l)));
+        let mut got: Vec<[&[u8]; 7]> = Vec::new();
+        for_each_record::<7>(&text, |r| got.push(r));
+        assert!(want.len() > 1000);
+        assert_eq!(got, want);
         assert_eq!(price(b"0250"), Some(250));
         assert_eq!(price(b"10000001"), None);
         assert_eq!(price(b"1000\r"), None);
