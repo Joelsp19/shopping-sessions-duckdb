@@ -1,23 +1,22 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm
+# Shopping Sessions: native Rust pipeline (team Ardere).
+# The scorers are linux/amd64 (Intel Xeon, Cascade Lake or newer). They build
+# this file natively; no FROM line pins a platform.
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
+# ---- build: compile the single static-ish binary (build time is never timed)
+FROM rust:1.87-slim-bookworm AS build
+WORKDIR /src
+# Cascade Lake and newer all have AVX2/BMI2 (x86-64-v3).
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+COPY rust/Cargo.toml rust/Cargo.lock ./
+# Fetch and build dependencies first, in their own cached layer.
+RUN mkdir src && echo "fn main() {}" > src/main.rs && touch src/parse.rs src/out.rs \
+    && cargo build --release --locked && rm -rf src
+COPY rust/src ./src
+RUN touch src/main.rs && cargo build --release --locked && strip target/release/sessions
+
+# ---- run: just the binary. Root FS is read-only at run time; it writes only
+# to $OUTPUT_DIR and needs no temp space (everything stays in memory).
+FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+COPY --from=build /src/target/release/sessions /app/sessions
+CMD ["/app/sessions"]

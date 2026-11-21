@@ -4,8 +4,9 @@ out/
 *.md
 .git
 .tmp/
-out/
 __pycache__/
 *.pyc
 dev-answer/
 scripts/
+pipeline/
+rust/target/
