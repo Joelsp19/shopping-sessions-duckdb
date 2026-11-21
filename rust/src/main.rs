@@ -599,8 +599,11 @@ fn main() {
         NP + ck_chunks.len(),
         || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default() },
         |st, task| {
-            if task < NP {
-                let dp = task;
+            // click chunks first: each is several times a dedup bucket's work,
+            // and must not be what the last threads are still doing
+            let nck = ck_chunks.len();
+            if task >= nck {
+                let dp = task - nck;
                 let total: usize = ev_parts.iter().map(|w| w[dp].len()).sum();
                 let cap = (total * 2).next_power_of_two().max(16);
                 if st.tab.len() < cap {
@@ -655,8 +658,8 @@ fn main() {
                     }
                     pend.clear();
                 };
-                populate(ck_chunks[task - NP]);
-                for_each_record::<4>(ck_chunks[task - NP], #[inline(always)] |[cid, user, cmp, ts]| {
+                populate(ck_chunks[task]);
+                for_each_record::<4>(ck_chunks[task], #[inline(always)] |[cid, user, cmp, ts]| {
                     if cid.is_empty() || user.is_empty() {
                         return;
                     }
