@@ -674,6 +674,75 @@ pub fn ts_ms(s: &[u8]) -> Option<i64> {
     ts_ms_scalar(s)
 }
 
+/// ts_ms with a small cache of validated dates: a line's 'YYYY-MM-DDT' is
+/// looked up by its exact bytes, and only 'HH:MM:SS' is parsed (SWAR).
+pub struct TsCache {
+    e: Box<[(u64, u32, i64); 512]>,
+}
+impl Default for TsCache {
+    fn default() -> Self {
+        TsCache { e: Box::new([(0, u32::MAX, 0); 512]) }
+    }
+}
+impl TsCache {
+    #[inline(always)]
+    pub fn ts(&mut self, s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if n == 20 && s[19] == b'Z' {
+            return self.iso19(s);
+        }
+        if n == 25 {
+            if (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+                let oh = d2(s, 20)?;
+                let om = d2(s, 23)?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                let off = (oh * 60 + om) * 60_000;
+                let base = self.iso19(s)?;
+                return Some(if s[19] == b'+' { base - off } else { base + off });
+            }
+        }
+        if n >= 1 && n <= 16 {
+            return digits16(s);
+        }
+        ts_ms_scalar(s)
+    }
+
+    /// iso19 for s.len() >= 20.
+    #[inline(always)]
+    pub fn iso19(&mut self, s: &[u8]) -> Option<i64> {
+        debug_assert!(s.len() >= 20);
+        let a = u64::from_le_bytes(s[0..8].try_into().unwrap());
+        let b = u32::from_le_bytes(s[8..12].try_into().unwrap()) & 0x00FF_FFFF;
+        let x = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        // HH:MM:SS
+        const M: u64 = 0xFFFF_00FF_FF00_FFFF;
+        const ZERO: u64 = 0x3030_0030_3000_3030;
+        const SEP: u64 = 0x0000_3A00_003A_0000;
+        let y = (x ^ ZERO) & M;
+        let ok_shape = (x & 0xF0F0_FFF0_F0FF_F0F0) == (ZERO | SEP);
+        let ok_dig = (y + 0x0606_0006_0600_0606) & 0xF0F0_00F0_F000_F0F0 == 0;
+        if !(ok_shape & ok_dig) {
+            return None;
+        }
+        let v = y * 10 + (y >> 8);
+        let (h, mi, se) = ((v & 0xFF) as i64, ((v >> 24) & 0xFF) as i64, ((v >> 48) & 0xFF) as i64);
+        if (h > 23) | (mi > 59) | (se > 59) {
+            return None;
+        }
+        let tod = (h * 3600 + mi * 60 + se) * 1000;
+        let i = ((a ^ (b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) as usize;
+        let e = unsafe { self.e.get_unchecked_mut(i) };
+        if e.0 == a && e.1 == b {
+            return Some(e.2 + tod);
+        }
+        let r = iso19(s)?;
+        *e = (a, b, r - tod);
+        Some(r)
+    }
+}
+
 /// 1..=16 ASCII digits -> value; None if any byte is not a digit.
 #[inline(always)]
 fn digits16(s: &[u8]) -> Option<i64> {
@@ -979,6 +1048,7 @@ mod tests {
             }
             assert_eq!(iso19(&t), iso19_scalar(&t), "{}", String::from_utf8_lossy(&t));
         }
+        let mut tc = TsCache::default();
         let shapes: [&[u8]; 6] = [b"2026-09-07T13:45:59Z", b"2026-09-07T13:45:59+05:30", b"1789316537000", b"0001789316537000", b"12345678901234567", b"7"];
         let alpha = b"0123456789-T:Z+ 9";
         for _ in 0..300000 {
@@ -997,6 +1067,7 @@ mod tests {
                 t[i] = alpha[((x >> (30 + 5 * k)) % alpha.len() as u64) as usize];
             }
             assert_eq!(ts_ms(&t), ts_ms_scalar(&t), "{}", String::from_utf8_lossy(&t));
+            assert_eq!(tc.ts(&t), ts_ms_scalar(&t), "cache {}", String::from_utf8_lossy(&t));
         }
         for y in [1899, 1900, 1970, 2000, 2024, 2100, 2199, 2200, 9999] {
             for (m, d) in [(2, 28), (2, 29), (2, 30), (4, 31), (12, 31), (1, 1), (13, 1), (0, 5)] {

@@ -23,7 +23,7 @@ mod parse;
 
 use memmap2::Mmap;
 use parquet::data_type::ByteArray;
-use parse::{fields, for_each_line, for_each_record, hash_bytes, mix, pack_id, price, ts_ms, unpack_id, DAY_MS, FALLBACK};
+use parse::{fields, for_each_line, for_each_record, hash_bytes, mix, pack_id, price, ts_ms, unpack_id, TsCache, DAY_MS, FALLBACK};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const NP: usize = 256;
+const NPB: u32 = 8; // log2 of the bucket count
+const NP: usize = 1 << NPB;
 /// Profiling probes: how many times to run (parse, dedup+clicks, sweep).
 /// Always (1, 1, 1) in a real build.
 const PROBE: (usize, usize, usize) = (1, 1, 1);
@@ -43,7 +44,7 @@ const INVALID: u32 = u32::MAX;
 
 #[inline]
 fn bucket(h: u64) -> usize {
-    (h >> 56) as usize
+    (h >> (64 - NPB)) as usize
 }
 
 // ---------- small-table hashing for the cold string maps (products, campaigns) ----------
@@ -533,17 +534,17 @@ fn main() {
     }
     lap("people");
     let copies = {
-        let run = || par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
+        let run = || par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default(), TsCache::default()), |(bufs, cd, tc), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
                     return;
                 }
                 let e = cd.code(eid);
-                let ing = ts_ms(ing).unwrap_or(i64::MAX);
+                let ing = tc.ts(ing).unwrap_or(i64::MAX);
                 let mut c = ECopy { eid: e, user: 0, ing, t: INVALID, pay: 0 };
                 if !user.is_empty() && !pr_id.is_empty() {
-                    if let Some(x) = ts_ms(ts) {
+                    if let Some(x) = tc.ts(ts) {
                         if x >= ws && x < we {
                             let ok = match kind(ty) {
                                 1 => true,
@@ -574,7 +575,7 @@ fn main() {
     };
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
-    for (b, cd) in copies {
+    for (b, cd, _) in copies {
         merge(&mut reg, cd);
         ev_parts.push(b);
     }
@@ -600,11 +601,12 @@ fn main() {
         ck: Vec<Vec<CkRec>>,
         pend: Vec<CkRec>,
         cd: Coder<'a>,
+        tc: TsCache,
     }
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default() },
+        || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default(), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -654,7 +656,7 @@ fn main() {
             } else {
                 // valid clicks are batched with p = user code, so the person
                 // lookups can be prefetched before they are resolved
-                let (bufs, cd, pend) = (&mut st.ck, &mut st.cd, &mut st.pend);
+                let (bufs, cd, pend, tc) = (&mut st.ck, &mut st.cd, &mut st.pend, &mut st.tc);
                 let flush = |pend: &mut Vec<CkRec>, bufs: &mut Vec<Vec<CkRec>>| {
                     for r in pend.iter() {
                         prefetch(&person.e, person.mask, r.p);
@@ -671,7 +673,7 @@ fn main() {
                         return;
                     }
                     let Some(c) = camp_of(cmp) else { return };
-                    match ts_ms(ts) {
+                    match tc.ts(ts) {
                         Some(x) if x >= cbase && x < we => {
                             pend.push(CkRec { p: cd.code(user), cid: cd.code(cid), t: (x - cbase) as u32, camp: c });
                             if pend.len() == 32 {
@@ -1001,7 +1003,7 @@ fn kind(t: &[u8]) -> u8 {
 /// Bin of a person code inside its bucket: `bits` bits just below the bucket's.
 #[inline]
 fn sub_bin(p: u64, bits: u32) -> usize {
-    (mix(p) >> (56 - bits)) as usize & ((1 << bits) - 1)
+    (mix(p) >> (64 - NPB - bits)) as usize & ((1 << bits) - 1)
 }
 
 /// Bin bits for a bucket of n records: ~4 records per bin, so a bin is
