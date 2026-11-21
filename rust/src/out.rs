@@ -21,7 +21,9 @@ pub fn write(path: &Path, schema: &str, cols: Vec<Col>) {
     let props = Arc::new(
         WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
-            .set_dictionary_enabled(false)
+            .set_dictionary_enabled(true)
+            .set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from("user_id"), false)
+            .set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from("campaign_id"), false)
             .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
             .build(),
     );
