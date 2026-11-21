@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const NPB: u32 = 10; // log2 of the bucket count
+const NPB: u32 = 8; // log2 of the bucket count
 const NP: usize = 1 << NPB;
 /// Profiling probes: how many times to run (parse, dedup+clicks, sweep).
 /// Always (1, 1, 1) in a real build.
@@ -244,6 +244,95 @@ fn par_fin<S: Send>(
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// One 64-byte cache line.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u64; 8]);
+
+/// Records scattered into NP buckets. Each bucket's next cache line is
+/// staged in a 64-byte slot (L1) and written out whole with streaming
+/// stores, so the destination line is never read from memory first.
+/// T's size must divide 64. Call `finish` before reading.
+struct Scatter<T> {
+    stage: Vec<Line>,
+    fill: Vec<u8>,
+    out: Vec<Vec<Line>>,
+    n: Vec<usize>,
+    _t: std::marker::PhantomData<T>,
+}
+unsafe impl<T: Send> Send for Scatter<T> {}
+unsafe impl<T: Sync> Sync for Scatter<T> {}
+impl<T: Copy> Scatter<T> {
+    const PER: usize = 64 / std::mem::size_of::<T>();
+    fn new(items: usize) -> Self {
+        assert!(64 % std::mem::size_of::<T>() == 0);
+        let lines = items / Self::PER + 2;
+        Scatter {
+            stage: vec![Line([0; 8]); NP],
+            fill: vec![0; NP],
+            out: (0..NP).map(|_| Vec::with_capacity(lines)).collect(),
+            n: vec![0; NP],
+            _t: std::marker::PhantomData,
+        }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        unsafe {
+            let f = *self.fill.get_unchecked(b) as usize;
+            let st = self.stage.as_mut_ptr().add(b);
+            (st as *mut T).add(f).write(x);
+            if f + 1 == Self::PER {
+                let v = self.out.get_unchecked_mut(b);
+                if v.len() == v.capacity() {
+                    v.reserve(v.len().max(64));
+                }
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                {
+                    use std::arch::x86_64::*;
+                    let src = st as *const __m256i;
+                    let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
+                    _mm256_stream_si256(dst, _mm256_load_si256(src));
+                    _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                v.as_mut_ptr().add(v.len()).write(*st);
+                v.set_len(v.len() + 1);
+                *self.fill.get_unchecked_mut(b) = 0;
+            } else {
+                *self.fill.get_unchecked_mut(b) = (f + 1) as u8;
+            }
+        }
+    }
+    /// Orders this thread's streaming stores before later loads by others.
+    #[inline]
+    fn fence(&self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence()
+        };
+    }
+    /// Moves the partly filled staged lines into place.
+    fn finish(&mut self) {
+        self.fence();
+        for b in 0..NP {
+            let f = self.fill[b] as usize;
+            let v = &mut self.out[b];
+            self.n[b] = v.len() * Self::PER + f;
+            if f > 0 {
+                v.push(self.stage[b]);
+            }
+            self.fill[b] = 0;
+        }
+    }
+}
+impl<T> std::ops::Index<usize> for Scatter<T> {
+    type Output = [T];
+    #[inline]
+    fn index(&self, b: usize) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.out[b].as_ptr() as *const T, self.n[b]) }
+    }
 }
 
 fn reserved<T>(n: usize) -> Vec<Vec<T>> {
@@ -534,7 +623,7 @@ fn main() {
     }
     lap("people");
     let copies = {
-        let run = || par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default(), TsCache::default()), |(bufs, cd, tc), ci| {
+        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per), Coder::default(), TsCache::default()), |(bufs, cd, tc), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -565,8 +654,9 @@ fn main() {
                         }
                     }
                 }
-                bufs[bucket(mix(e))].push(c);
+                bufs.push(bucket(mix(e)), c);
             });
+            bufs.fence();
         });
         for _ in 1..PROBE.0 {
             drop(run()); // profiling probe: repeat the phase
@@ -575,8 +665,9 @@ fn main() {
     };
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
-    for (b, cd, _) in copies {
+    for (mut b, cd, _) in copies {
         merge(&mut reg, cd);
+        b.finish();
         ev_parts.push(b);
     }
     // linked users map to their person; everyone else names themselves
@@ -597,7 +688,7 @@ fn main() {
     struct Work<'a> {
         tab: Vec<(u64, u32)>,
         best: Vec<ECopy>,
-        ev: Vec<Vec<EvRec>>,
+        ev: Scatter<EvRec>,
         ck: Vec<Vec<CkRec>>,
         pend: Vec<CkRec>,
         cd: Coder<'a>,
@@ -606,7 +697,7 @@ fn main() {
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default(), tc: TsCache::default() },
+        || Work { tab: Vec::new(), best: Vec::new(), ev: Scatter::new(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default(), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -650,9 +741,10 @@ fn main() {
                     }
                     if c.t != INVALID && c.ing - (ws + c.t as i64) <= DAY_MS {
                         let p = person_of(c.user);
-                        st.ev[bucket(mix(p))].push(EvRec { p, t: c.t, pay: c.pay });
+                        st.ev.push(bucket(mix(p)), EvRec { p, t: c.t, pay: c.pay });
                     }
                 }
+                st.ev.fence();
             } else {
                 // valid clicks are batched with p = user code, so the person
                 // lookups can be prefetched before they are resolved
@@ -697,7 +789,9 @@ fn main() {
     let mut cks = Vec::with_capacity(work.len());
     for wk in work {
         merge(&mut reg, wk.cd);
-        evs.push(wk.ev);
+        let mut e = wk.ev;
+        e.finish();
+        evs.push(e);
         cks.push(wk.ck);
     }
     lap("dedup+ck");
