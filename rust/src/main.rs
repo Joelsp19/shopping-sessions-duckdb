@@ -467,21 +467,25 @@ fn main() {
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 6 / 5 + 64;
 
-    // ---- people (one thread: links -> union-find -> person codes) while
-    // ---- every core parses events: validate each copy, bucket by hash(event_id)
+    // ---- people (links -> union-find -> person codes), then events: every
+    // ---- core validates copies and buckets them by hash(event_id)
+    let tc = Instant::now();
     let ln_chunks = chunks(&ln_maps);
     let ev_chunks = chunks(&ev_maps);
     let ev_per = per(ev_bytes, 76);
-    let ((person, link_reg), copies) = std::thread::scope(|sc| {
-        let h = sc.spawn(|| {
-            let t = Instant::now();
-            let r = people(&ln_chunks);
-            if std::env::var_os("SS_VERBOSE").is_some() {
-                eprintln!("  (people {:.3}s)", t.elapsed().as_secs_f64());
-            }
-            r
-        });
-        let copies = par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
+    if std::env::var_os("SS_VERBOSE").is_some() {
+        eprintln!("  (chunks {:.3}s)", tc.elapsed().as_secs_f64());
+    }
+    // people first, on every thread (it is random-access work that slows
+    // badly when it shares the machine with the event parser)
+    let tp = Instant::now();
+    let (person, link_reg) = people(&ln_chunks, nt);
+    if std::env::var_os("SS_VERBOSE").is_some() {
+        eprintln!("  (people {:.3}s)", tp.elapsed().as_secs_f64());
+    }
+    lap("people");
+    let copies = {
+        par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -514,9 +518,8 @@ fn main() {
                 }
                 bufs[bucket(mix(e))].push(c);
             });
-        });
-        (h.join().unwrap(), copies)
-    });
+        })
+    };
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
     for (b, cd) in copies {
@@ -530,7 +533,7 @@ fn main() {
         let m = (f as u64).wrapping_neg();
         (v & m) | (u & !m)
     };
-    lap("parse+ppl");
+    lap("parse");
 
     // ---- one task pool: dedup each event bucket (earliest ingest wins, then
     // ---- validate + late check), and parse clicks. Both map users to people
@@ -1033,41 +1036,6 @@ fn radix11(v: &mut Vec<(u64, u32)>, tmp: &mut Vec<(u64, u32)>, bits: u32) {
     }
 }
 
-/// LSD radix sort by a u64 key, 8 bits per pass; passes where every key has
-/// the same byte are skipped. Stable.
-fn radix_sort<T: Copy + Default>(v: &mut Vec<T>, key: impl Fn(&T) -> u64) {
-    let n = v.len();
-    if n < 2 {
-        return;
-    }
-    let mut hist = vec![[0u32; 256]; 8];
-    for x in v.iter() {
-        let k = key(x);
-        for b in 0..8 {
-            hist[b][(k >> (8 * b)) as usize & 255] += 1;
-        }
-    }
-    let mut tmp: Vec<T> = vec![T::default(); n];
-    for b in 0..8 {
-        let h = &mut hist[b];
-        if h.iter().any(|&c| c as usize == n) {
-            continue;
-        }
-        let mut sum = 0u32;
-        for c in h.iter_mut() {
-            let t = *c;
-            *c = sum;
-            sum += t;
-        }
-        for x in v.iter() {
-            let d = (key(x) >> (8 * b)) as usize & 255;
-            tmp[h[d] as usize] = *x;
-            h[d] += 1;
-        }
-        std::mem::swap(v, &mut tmp);
-    }
-}
-
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
         let g = parent[parent[x as usize] as usize];
@@ -1079,48 +1047,156 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 
 /// Links -> union-find -> for every linked ID that does not name its person,
 /// ID code -> person code (the byte-wise smallest ID of the person).
-fn people<'a>(chunks: &[&'a [u8]]) -> (Table<u64>, Reg<'a>) {
+/// A raw pointer that may be shared across the worker threads; every use
+/// writes disjoint slots.
+#[derive(Clone, Copy)]
+struct SharedPtr<T>(*mut T);
+unsafe impl<T> Send for SharedPtr<T> {}
+unsafe impl<T> Sync for SharedPtr<T> {}
+impl<T> SharedPtr<T> {
+    #[inline(always)]
+    unsafe fn write(self, i: usize, v: T) {
+        self.0.add(i).write(v)
+    }
+    #[inline(always)]
+    fn ptr(self) -> *mut T {
+        self.0
+    }
+}
+
+/// Links -> union-find -> for every linked ID that does not name its person,
+/// ID code -> person code (the byte-wise smallest ID of the person).
+/// Everything but the union-find itself runs on all threads.
+fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (Table<u64>, Reg<'a>) {
     let t0 = Instant::now();
     let verbose = std::env::var_os("SS_VERBOSE").is_some();
-    let mut cd = Coder::default();
-    let mut edges: Vec<(u64, u64)> = Vec::new();
-    for ch in chunks {
-        for_each_record::<2>(ch, #[inline(always)] |[a, b]| {
+    let lapv = |what: &str| {
+        if verbose {
+            eprintln!("  (people {what} {:.3}s)", t0.elapsed().as_secs_f64());
+        }
+    };
+    // 1. parse
+    let parts = par(nt, chunks.len(), || (Vec::<(u64, u64)>::new(), Coder::default()), |(e, cd), ci| {
+        for_each_record::<2>(chunks[ci], #[inline(always)] |[a, b]| {
             if !a.is_empty() && !b.is_empty() {
                 let (x, y) = (cd.code(a), cd.code(b));
                 if x != y {
-                    edges.push((x, y));
+                    e.push((x, y));
                 }
             }
         });
-    }
-    if verbose {
-        eprintln!("  (people parse {:.3}s)", t0.elapsed().as_secs_f64());
-    }
+    });
     let mut reg: Reg = HashMap::new();
-    merge(&mut reg, cd);
-    // Dense IDs by sorting the endpoints: id order = code order, which is
-    // byte order for packed codes.
+    let mut edges: Vec<(u64, u64)> = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+    for (e, cd) in parts {
+        merge(&mut reg, cd);
+        edges.extend_from_slice(&e);
+    }
     let m = edges.len();
-    let mut ends: Vec<(u64, u32)> = Vec::with_capacity(2 * m);
-    for (k, &(x, y)) in edges.iter().enumerate() {
-        ends.push((x, 2 * k as u32));
-        ends.push((y, 2 * k as u32 + 1));
+    let n2 = 2 * m;
+    lapv("parse");
+    if m == 0 {
+        return (Table::new(0), reg);
     }
-    drop(edges);
-    radix_sort(&mut ends, |e| e.0);
-    let mut id = vec![0u32; 2 * m];
-    let mut codes: Vec<u64> = Vec::new();
-    for (k, &(c, slot)) in ends.iter().enumerate() {
-        if k == 0 || ends[k - 1].0 != c {
-            codes.push(c);
+    let end_code = |j: usize| if j & 1 == 0 { edges[j >> 1].0 } else { edges[j >> 1].1 };
+
+    // 2. endpoints sorted by code: sample splitters, partition, sort partitions
+    const NPART: usize = 256;
+    let mut sample: Vec<u64> = (0..4096).map(|i| end_code(i * n2 / 4096)).collect();
+    sample.sort_unstable();
+    let split: Vec<u64> = (1..NPART).map(|k| sample[k * 4096 / NPART]).collect();
+    let part_of = |c: u64| split.partition_point(|&x| x <= c);
+    let ranges = nt.max(1) * 4;
+    let rng = |r: usize| (r * m / ranges, (r + 1) * m / ranges);
+    // per range: partition of each endpoint and a histogram
+    let hists = par(nt, ranges, || Vec::<(usize, Vec<u32>)>::new(), |out, r| {
+        let mut h = vec![0u32; NPART];
+        let (lo, hi) = rng(r);
+        for j in 2 * lo..2 * hi {
+            h[part_of(end_code(j))] += 1;
         }
-        id[slot as usize] = codes.len() as u32 - 1;
+        out.push((r, h));
+    });
+    let mut hist: Vec<Vec<u32>> = vec![Vec::new(); ranges];
+    for v in hists {
+        for (r, h) in v {
+            hist[r] = h;
+        }
     }
-    drop(ends);
-    let nu = codes.len();
-    // union-find, linking the larger root under the smaller: every root is the
-    // smallest id (= smallest code) of its component
+    // offsets: partition-major, then range
+    let mut off = vec![vec![0u32; NPART]; ranges];
+    let mut pstart = vec![0usize; NPART + 1];
+    let mut acc = 0u32;
+    for pt in 0..NPART {
+        pstart[pt] = acc as usize;
+        for r in 0..ranges {
+            off[r][pt] = acc;
+            acc += hist[r][pt];
+        }
+    }
+    pstart[NPART] = acc as usize;
+    let mut ends: Vec<(u64, u32)> = Vec::with_capacity(n2);
+    let ep = SharedPtr(ends.as_mut_ptr());
+    par(nt, ranges, || (), |_, r| {
+        let mut o = off[r].clone();
+        let (lo, hi) = rng(r);
+        for j in 2 * lo..2 * hi {
+            let c = end_code(j);
+            let pt = part_of(c);
+            unsafe { ep.write(o[pt] as usize, (c, j as u32)) };
+            o[pt] += 1;
+        }
+    });
+    unsafe { ends.set_len(n2) };
+    // sort each partition and count its distinct codes
+    let ends_p = SharedPtr(ends.as_mut_ptr());
+    let uniq = par(nt, NPART, || Vec::<(usize, u32)>::new(), |out, pt| {
+        let (a, b) = (pstart[pt], pstart[pt + 1]);
+        let g = unsafe { std::slice::from_raw_parts_mut(ends_p.ptr().add(a), b - a) };
+        g.sort_unstable_by_key(|e| e.0);
+        let mut u = 0u32;
+        for k in 0..g.len() {
+            if k == 0 || g[k - 1].0 != g[k].0 {
+                u += 1;
+            }
+        }
+        out.push((pt, u));
+    });
+    let mut ubase = vec![0u32; NPART + 1];
+    for v in uniq {
+        for (pt, u) in v {
+            ubase[pt + 1] = u;
+        }
+    }
+    for pt in 0..NPART {
+        ubase[pt + 1] += ubase[pt];
+    }
+    let nu = ubase[NPART] as usize;
+    lapv("sort");
+
+    // 3. dense ids (id order = code order) and each endpoint's id
+    let mut codes: Vec<u64> = Vec::with_capacity(nu);
+    let mut id: Vec<u32> = Vec::with_capacity(n2);
+    let (cp, ip) = (SharedPtr(codes.as_mut_ptr()), SharedPtr(id.as_mut_ptr()));
+    par(nt, NPART, || (), |_, pt| {
+        let g = &ends[pstart[pt]..pstart[pt + 1]];
+        let mut next = ubase[pt];
+        for k in 0..g.len() {
+            if k == 0 || g[k - 1].0 != g[k].0 {
+                unsafe { cp.write(next as usize, g[k].0) };
+                next += 1;
+            }
+            unsafe { ip.write(g[k].1 as usize, next - 1) };
+        }
+    });
+    unsafe {
+        codes.set_len(nu);
+        id.set_len(n2);
+    }
+    std::thread::spawn(move || drop((edges, ends)));
+
+    // 4. union-find, linking the larger root under the smaller: every root is
+    // the smallest id (= smallest code) of its component
     let mut parent: Vec<u32> = (0..nu as u32).collect();
     for k in 0..m {
         let (ra, rb) = (find(&mut parent, id[2 * k]), find(&mut parent, id[2 * k + 1]));
@@ -1129,38 +1205,60 @@ fn people<'a>(chunks: &[&'a [u8]]) -> (Table<u64>, Reg<'a>) {
             parent[hi as usize] = lo;
         }
     }
-    drop(id);
-    let mut root = vec![0u32; nu];
-    for u in 0..nu {
-        root[u] = find(&mut parent, u as u32);
-    }
+    lapv("uf");
+    // roots, read-only and in parallel
+    let mut root: Vec<u32> = Vec::with_capacity(nu);
+    let rp = SharedPtr(root.as_mut_ptr());
+    let par_n = nt.max(1) * 8;
+    par(nt, par_n, || (), |_, r| {
+        for u in r * nu / par_n..(r + 1) * nu / par_n {
+            let mut x = u as u32;
+            while parent[x as usize] != x {
+                x = parent[x as usize];
+            }
+            unsafe { rp.write(u, x) };
+        }
+    });
+    unsafe { root.set_len(nu) };
     // Packed codes compare as bytes; fallback IDs need a byte-wise pass.
-    let mut best: Vec<u64> = (0..nu).map(|u| codes[root[u] as usize]).collect();
+    let mut best_root: Vec<u64> = Vec::new();
     if !reg.is_empty() {
+        best_root = codes.clone();
         for u in 0..nu {
             let r = root[u] as usize;
-            if id_lt(codes[u], best[r], &reg) {
-                best[r] = codes[u];
+            if id_lt(codes[u], best_root[r], &reg) {
+                best_root[r] = codes[u];
             }
         }
-        for u in 0..nu {
-            best[u] = best[root[u] as usize];
-        }
     }
-    if verbose {
-        eprintln!("  (people uf {:.3}s)", t0.elapsed().as_secs_f64());
-    }
-    let mut person: Table<u64> = Table::new(nu);
-    for u in 0..nu {
-        if u + 16 < nu {
-            prefetch(&person.e, person.mask, codes[u + 16]);
+    let person_code = |u: usize| if best_root.is_empty() { codes[root[u] as usize] } else { best_root[root[u] as usize] };
+
+    // 5. person table, filled in parallel: a slot is claimed by a
+    // compare-and-swap on its key, then its value is written
+    let person: Table<u64> = Table::new(nu);
+    let (tp, tmask) = (SharedPtr(person.e.as_ptr() as *mut (u64, u64)), person.mask);
+    par(nt, par_n, || (), |_, r| {
+        let (lo, hi) = (r * nu / par_n, (r + 1) * nu / par_n);
+        for u in lo..hi {
+            if u + 16 < hi {
+                prefetch(&person.e, tmask, codes[u + 16]);
+            }
+            let (k, p) = (codes[u], person_code(u));
+            if p == k {
+                continue;
+            }
+            let mut i = mix(k) as usize & tmask;
+            loop {
+                let key = unsafe { &*(tp.ptr().add(i) as *const std::sync::atomic::AtomicU64) };
+                if key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    unsafe { (*tp.ptr().add(i)).1 = p };
+                    break;
+                }
+                i = (i + 1) & tmask;
+            }
         }
-        let p = best[u];
-        if p != codes[u] {
-            let (i, _) = person.slot(codes[u]);
-            person.set(i, codes[u], p);
-        }
-    }
+    });
+    lapv("table");
     (person, reg)
 }
 
