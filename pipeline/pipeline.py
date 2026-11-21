@@ -59,8 +59,8 @@ def main(data, out, scratch, ncpu, mem_gb):
     clean_events(con, data, ws_ms, we_ms); lap("events")
     clean_clicks(con, data, ws_ms, we_ms); lap("clicks")
     encode(con); lap("encode")
-    build_people(con); lap("people")
-    build_sessions(con, ws_ms); lap("sessions")
+    pid_of_uid = build_people(con); lap("people")
+    build_sessions(con, ws_ms, pid_of_uid); lap("sessions")
     build_outputs(con, out); lap("outputs")
     print(f"{'total':<10}{time.perf_counter() - t0:7.2f}s", file=sys.stderr)
 
