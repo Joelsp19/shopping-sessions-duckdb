@@ -33,6 +33,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 const NP: usize = 256;
+/// Profiling probes: how many times to run (parse, dedup+clicks, sweep).
+/// Always (1, 1, 1) in a real build.
+const PROBE: (usize, usize, usize) = (1, 1, 1);
 const GAP: u32 = 1_800_000;
 const WEEK: i64 = 604_800_000;
 const CHUNK: usize = 4 << 20;
@@ -530,7 +533,7 @@ fn main() {
     }
     lap("people");
     let copies = {
-        par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
+        let run = || par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -563,7 +566,11 @@ fn main() {
                 }
                 bufs[bucket(mix(e))].push(c);
             });
-        })
+        });
+        for _ in 1..PROBE.0 {
+            drop(run()); // profiling probe: repeat the phase
+        }
+        run()
     };
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
@@ -594,7 +601,7 @@ fn main() {
         pend: Vec<CkRec>,
         cd: Coder<'a>,
     }
-    let work = par(
+    let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
         || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default() },
@@ -678,6 +685,10 @@ fn main() {
             }
         },
     );
+    for _ in 1..PROBE.1 {
+        drop(run_dedup()); // profiling probe: repeat the phase
+    }
+    let work = run_dedup();
     // freeing ~0.7 GB unmaps every page: let a background thread do it
     std::thread::spawn(move || drop(ev_parts));
     let mut evs = Vec::with_capacity(work.len());
@@ -749,7 +760,7 @@ fn main() {
         );
     };
 
-    let sweeps: Vec<Sweep> = par_fin(
+    let run_sweep = || par_fin(
         nt,
         NP,
         || Sweep {
@@ -905,6 +916,10 @@ fn main() {
         },
         |st, k| write_part(&st.rows, k),
     );
+    for _ in 1..PROBE.2 {
+        drop(run_sweep()); // profiling probe: repeat the phase
+    }
+    let sweeps: Vec<Sweep> = run_sweep();
     std::thread::spawn(move || drop((evs, cks)));
     lap("sweep");
 
