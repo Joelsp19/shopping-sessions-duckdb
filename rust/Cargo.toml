@@ -11,6 +11,7 @@ path = "src/main.rs"
 memmap2 = "0.9"
 memchr = "2"
 parquet = { version = "55", default-features = false }
+bytes = "1"
 
 [profile.release]
 opt-level = 3

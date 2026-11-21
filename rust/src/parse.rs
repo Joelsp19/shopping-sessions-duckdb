@@ -192,23 +192,24 @@ pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&
                 let nq = cq - q_line;
                 let mut out: [&'a [u8]; N] = [&chunk[..0]; N];
                 let mut s = start;
-                let mut ok = 1u64;
-                let mut paired = 0u64;
+                let mut bad_q = 0usize;
+                let mut paired = 0usize;
+                let ptr = chunk.as_ptr();
                 for k in 0..N {
                     let e = if k + 1 < N { cm[ci + k] as usize } else { end };
-                    let n = e - s;
-                    let c0 = unsafe { *chunk.get_unchecked(s.min(len - 1)) };
-                    let c1 = unsafe { *chunk.get_unchecked(e.max(1) - 1) };
-                    let q0 = ((n > 0) & (c0 == b'"')) as usize;
-                    let q1 = ((n >= 2) & (c1 == b'"')) as u64;
-                    ok &= (q0 as u64 ^ 1) | q1;
-                    paired += 2 * q0 as u64;
-                    let a = s + q0;
-                    out[k] = unsafe { chunk.get_unchecked(a..(e - q0).max(a)) };
+                    // An empty field's first byte is its separator (or, at the
+                    // very end, the comma before it), never a quote.
+                    let c0 = unsafe { *ptr.add(s.min(len - 1)) };
+                    let c1 = unsafe { *ptr.add(e.max(1) - 1) };
+                    let q0 = (c0 == b'"') as usize;
+                    let q1 = ((c1 == b'"') & (e >= s + 2)) as usize;
+                    bad_q |= q0 & !q1;
+                    paired += q0;
+                    out[k] = unsafe { std::slice::from_raw_parts(ptr.add(s + q0), (e - s).saturating_sub(2 * q0)) };
                     s = e + 1;
                 }
                 ci += N - 1;
-                if ok != 0 && paired == nq {
+                if bad_q & 1 == 0 && 2 * paired as u64 == nq {
                     f(out);
                 }
             } else {
@@ -485,7 +486,7 @@ static MONTH_LEN: [u8; NY * 16] = {
 };
 
 /// 'YYYY-MM-DDTHH:MM:SS' at s[0..19] (s.len() >= 20), strictly validated -> epoch ms (UTC).
-#[inline]
+#[inline(always)]
 fn iso19(s: &[u8]) -> Option<i64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
     unsafe {
@@ -511,15 +512,23 @@ fn iso19(s: &[u8]) -> Option<i64> {
         // pairs (yh, yl, mo, d, h, mi, se, -) as 16-bit lanes
         let pa = _mm_shuffle_epi8(ta, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
         let v = _mm_maddubs_epi16(pa, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+        // seconds in lane 6 (s[17..19] = b[13..15])
+        let sec = _mm_maddubs_epi16(_mm_shuffle_epi8(tb, _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 13, 14, -1, -1)), _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 1, 0, 0));
+        let v = _mm_or_si128(v, sec);
+        // lanes: yh yl mo d h mi se 0
+        let bad = _mm_or_si128(
+            _mm_cmpgt_epi16(v, _mm_setr_epi16(99, 99, 12, 31, 23, 59, 59, 0)),
+            _mm_cmpgt_epi16(_mm_setr_epi16(0, 0, 1, 1, 0, 0, 0, 0), v),
+        );
+        if _mm_movemask_epi8(bad) != 0 {
+            return None;
+        }
         let y = _mm_extract_epi16::<0>(v) as i64 * 100 + _mm_extract_epi16::<1>(v) as i64;
         let mo = _mm_extract_epi16::<2>(v) as usize;
         let d = _mm_extract_epi16::<3>(v) as i64;
-        let h = _mm_extract_epi16::<4>(v) as i64;
-        let mi = _mm_extract_epi16::<5>(v) as i64;
-        let se = (s[17] - b'0') as i64 * 10 + (s[18] - b'0') as i64;
-        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
-            return None;
-        }
+        let hms = _mm_madd_epi16(_mm_srli_si128::<8>(v), _mm_setr_epi16(60, 1, 0, 0, 0, 0, 0, 0)); // h*60+mi
+        let hm = _mm_cvtsi128_si32(hms) as i64;
+        let se = _mm_extract_epi16::<6>(v) as i64;
         let yi = (y - Y0) as usize;
         if yi >= NY {
             return iso19_scalar(s);
@@ -528,7 +537,7 @@ fn iso19(s: &[u8]) -> Option<i64> {
         if d > MONTH_LEN[k] as i64 {
             return None;
         }
-        return Some((((MONTH0[k] as i64 + d - 1) * 24 + h) * 60 + mi) * 60_000 + se * 1000);
+        return Some(((MONTH0[k] as i64 + d - 1) * 1440 + hm) * 60_000 + se * 1000);
     }
     #[allow(unreachable_code)]
     iso19_scalar(s)
@@ -561,11 +570,71 @@ fn iso19_scalar(s: &[u8]) -> Option<i64> {
 
 /// Any `ts` field -> epoch ms, or None for a bad timestamp (rules.md "Timestamps").
 /// F3 values too long for 64 bits are returned as None: they are outside every window.
-#[inline]
+#[inline(always)]
 pub fn ts_ms(s: &[u8]) -> Option<i64> {
     let n = s.len();
     if n == 20 && s[19] == b'Z' {
         return iso19(s);
+    }
+    if n == 25 {
+        if (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+            let oh = d2(s, 20)?;
+            let om = d2(s, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 60 + om) * 60_000;
+            let base = iso19(s)?;
+            return Some(if s[19] == b'+' { base - off } else { base + off });
+        }
+    }
+    if n >= 1 && n <= 16 {
+        return digits16(s);
+    }
+    ts_ms_scalar(s)
+}
+
+/// 1..=16 ASCII digits -> value; None if any byte is not a digit.
+#[inline(always)]
+fn digits16(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    debug_assert!((1..=16).contains(&n));
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = if (s.as_ptr() as usize & 4095) <= 4096 - 16 {
+            _mm_loadu_si128(s.as_ptr() as *const __m128i)
+        } else {
+            let mut b = [0u8; 16];
+            b[..n].copy_from_slice(s);
+            _mm_loadu_si128(b.as_ptr() as *const __m128i)
+        };
+        let t = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let dm = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t)) as u32;
+        let want = (1u32 << n) - 1;
+        if dm & want != want {
+            return None;
+        }
+        // right-align the n digits (indexes < 0 select zero)
+        let iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let r = _mm_shuffle_epi8(t, _mm_add_epi8(iota, _mm_set1_epi8(n as i8 - 16)));
+        let x = _mm_maddubs_epi16(r, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+        let x = _mm_madd_epi16(x, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+        let x = _mm_packus_epi32(x, x);
+        let x = _mm_madd_epi16(x, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+        let hi = _mm_cvtsi128_si32(x) as i64;
+        let lo = _mm_extract_epi32::<1>(x) as i64;
+        return Some(hi * 100_000_000 + lo);
+    }
+    #[allow(unreachable_code)]
+    ts_ms_scalar(s)
+}
+
+/// Reference version of ts_ms.
+pub fn ts_ms_scalar(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 20 && s[19] == b'Z' {
+        return iso19_scalar(s);
     }
     if n == 0 {
         return None;
@@ -591,7 +660,7 @@ pub fn ts_ms(s: &[u8]) -> Option<i64> {
             return None;
         }
         let off = (oh * 60 + om) * 60_000;
-        let base = iso19(s)?;
+        let base = iso19_scalar(s)?;
         return Some(if s[19] == b'+' { base - off } else { base + off });
     }
     None
@@ -756,14 +825,12 @@ pub fn unpack_id(v: u64, out: &mut [u8; 10]) -> usize {
     n
 }
 
-/// murmur3 fmix64: spreads every input bit over the whole word.
-#[inline]
-pub fn mix(mut k: u64) -> u64 {
-    k ^= k >> 33;
-    k = k.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    k ^= k >> 33;
-    k = k.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
-    k ^ (k >> 33)
+/// Cheap 64-bit hash: a multiply carries every input bit into the high half,
+/// and folding the high half down mixes the low bits too.
+#[inline(always)]
+pub fn mix(k: u64) -> u64 {
+    let x = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^ (x >> 32)
 }
 
 #[cfg(test)]
@@ -831,6 +898,25 @@ mod tests {
                 t[0] = b'1' + (x >> 50) as u8 % 3; // other centuries
             }
             assert_eq!(iso19(&t), iso19_scalar(&t), "{}", String::from_utf8_lossy(&t));
+        }
+        let shapes: [&[u8]; 6] = [b"2026-09-07T13:45:59Z", b"2026-09-07T13:45:59+05:30", b"1789316537000", b"0001789316537000", b"12345678901234567", b"7"];
+        let alpha = b"0123456789-T:Z+ 9";
+        for _ in 0..300000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut t = shapes[(x % 6) as usize].to_vec();
+            if x >> 60 == 0 {
+                t.truncate(((x >> 20) % (t.len() as u64 + 1)) as usize);
+            }
+            for k in 0..(x >> 3) % 3 {
+                if t.is_empty() {
+                    break;
+                }
+                let i = ((x >> (8 + 8 * k)) % t.len() as u64) as usize;
+                t[i] = alpha[((x >> (30 + 5 * k)) % alpha.len() as u64) as usize];
+            }
+            assert_eq!(ts_ms(&t), ts_ms_scalar(&t), "{}", String::from_utf8_lossy(&t));
         }
         for y in [1899, 1900, 1970, 2000, 2024, 2100, 2199, 2200, 9999] {
             for (m, d) in [(2, 28), (2, 29), (2, 30), (4, 31), (12, 31), (1, 1), (13, 1), (0, 5)] {

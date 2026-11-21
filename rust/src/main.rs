@@ -329,8 +329,7 @@ struct Sweep {
     rows: Vec<URow>,
     ev: Vec<EvRec>,
     ck: Vec<CkRec>,
-    tmp_ev: Vec<EvRec>,
-    tmp_ck: Vec<CkRec>,
+    bins: Vec<u16>,
 }
 
 fn main() {
@@ -430,9 +429,9 @@ fn main() {
                 if !user.is_empty() && !pr_id.is_empty() {
                     if let Some(x) = ts_ms(ts) {
                         if x >= ws && x < we {
-                            let ok = match ty {
-                                b"view" | b"cart" => true,
-                                b"purchase" => match price(pr) {
+                            let ok = match kind(ty) {
+                                1 => true,
+                                2 => match price(pr) {
                                     Some(p) => {
                                         let cat = prod.get(&Key::new(pr_id)).copied().unwrap_or(unknown);
                                         c.pay = (p << 8) | cat;
@@ -589,8 +588,7 @@ fn main() {
             rows: Vec::new(),
             ev: Vec::new(),
             ck: Vec::new(),
-            tmp_ev: Vec::new(),
-            tmp_ck: Vec::new(),
+            bins: Vec::new(),
         },
         |st, task| {
             let q = order[task];
@@ -598,15 +596,11 @@ fn main() {
             let mut ck = std::mem::take(&mut st.ck);
             ev.clear();
             ck.clear();
-            for s in &evs {
-                ev.extend_from_slice(&s[q]);
-            }
-            let bits = bin_bits(ev.len());
-            group_sort(&mut ev, &mut st.tmp_ev, bits, |x| x.p, |x| x.t);
-            for s in &cks {
-                ck.extend_from_slice(&s[q]);
-            }
-            group_sort(&mut ck, &mut st.tmp_ck, bits, |x| x.p, |x| x.t);
+            let ev_src: Vec<&[EvRec]> = evs.iter().map(|s| &s[q][..]).collect();
+            let ck_src: Vec<&[CkRec]> = cks.iter().map(|s| &s[q][..]).collect();
+            let bits = bin_bits(ev_src.iter().map(|s| s.len()).sum());
+            group_sort(&ev_src, &mut ev, &mut st.bins, bits, |x| x.p, |x| x.t);
+            group_sort(&ck_src, &mut ck, &mut st.bins, bits, |x| x.p, |x| x.t);
 
             let mut catrev: Vec<(u32, i64)> = Vec::new();
             let mut ci = 0usize;
@@ -743,6 +737,7 @@ fn main() {
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
     std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
     let parts: Vec<&Vec<URow>> = sweeps.iter().map(|s| &s.rows).collect();
+    let cat_bytes: Vec<ByteArray> = cat_names.iter().map(|c| ByteArray::from(c.to_vec())).collect();
     par(nt, parts.len(), || (), |_, k| {
         let rows = parts[k];
         let mut top_v = Vec::new();
@@ -752,14 +747,34 @@ fn main() {
                 top_d.push(0i16);
             } else {
                 top_d.push(1i16);
-                top_v.push(ByteArray::from(cat_names[r.top as usize].to_vec()));
+                top_v.push(cat_bytes[r.top as usize].clone());
             }
+        }
+        // every user ID in one buffer; the column holds zero-copy slices of it
+        let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 10);
+        let mut ends: Vec<u32> = Vec::with_capacity(rows.len());
+        for r in rows {
+            if r.p < FALLBACK {
+                let mut b = [0u8; 10];
+                let n = unpack_id(r.p, &mut b);
+                buf.extend_from_slice(&b[..n]);
+            } else {
+                buf.extend_from_slice(reg[&r.p]);
+            }
+            ends.push(buf.len() as u32);
+        }
+        let buf = bytes::Bytes::from(buf);
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut a = 0usize;
+        for &e in &ends {
+            ids.push(ByteArray::from(buf.slice(a..e as usize)));
+            a = e as usize;
         }
         out::write(
             &ud.join(format!("part-{k}.parquet")),
             out::USER_DAILY,
             vec![
-                out::Col::Str(rows.iter().map(|r| ByteArray::from(id_vec(r.p, reg))).collect()),
+                out::Col::Str(ids),
                 out::Col::I32(rows.iter().map(|r| r.day).collect()),
                 out::Col::I64(rows.iter().map(|r| r.sessions).collect()),
                 out::Col::I64(rows.iter().map(|r| r.events).collect()),
@@ -813,6 +828,19 @@ fn main() {
     eprintln!("{:<10}{:7.3}s  ({} threads)", "total", t0.elapsed().as_secs_f64(), nt);
 }
 
+/// Event type: 1 = view or cart, 2 = purchase, 0 = anything else.
+#[inline(always)]
+fn kind(t: &[u8]) -> u8 {
+    match t.len() {
+        4 => {
+            let v = u32::from_le_bytes(t.try_into().unwrap());
+            (v == u32::from_le_bytes(*b"view") || v == u32::from_le_bytes(*b"cart")) as u8
+        }
+        8 => 2 * (u64::from_le_bytes(t.try_into().unwrap()) == u64::from_le_bytes(*b"purchase")) as u8,
+        _ => 0,
+    }
+}
+
 /// Bin of a person code inside its bucket: `bits` bits just below the bucket's.
 #[inline]
 fn sub_bin(p: u64, bits: u32) -> usize {
@@ -824,37 +852,41 @@ fn bin_bits(n: usize) -> u32 {
     ((n / 16).max(1).ilog2() + 1).clamp(4, 16)
 }
 
-/// Orders records by (sub_bin(person), person, time): one counting-sort pass
-/// on the bin, then a small sort of each bin (a bin holds ~1 person; persons
-/// sharing a bin are still separated by the (person, time) sort).
-fn group_sort<T: Copy>(v: &mut Vec<T>, tmp: &mut Vec<T>, bits: u32, p: impl Fn(&T) -> u64, t: impl Fn(&T) -> u32) {
-    let n = v.len();
-    if n < 2 {
-        return;
-    }
+/// Gathers the source slices into `out`, ordered by (sub_bin(person), person,
+/// time): one counting-sort pass on the bin straight from the sources, then a
+/// small sort of each bin (a bin holds ~1 person; persons sharing a bin are
+/// still separated by the (person, time) sort).
+fn group_sort<T: Copy>(src: &[&[T]], out: &mut Vec<T>, bins: &mut Vec<u16>, bits: u32, p: impl Fn(&T) -> u64, t: impl Fn(&T) -> u32) {
+    let n: usize = src.iter().map(|s| s.len()).sum();
     let nb = 1usize << bits;
     let mut start = vec![0u32; nb + 1];
-    let bins: Vec<u16> = v.iter().map(|x| sub_bin(p(x), bits) as u16).collect();
-    for &b in &bins {
+    bins.clear();
+    for s in src {
+        bins.extend(s.iter().map(|x| sub_bin(p(x), bits) as u16));
+    }
+    for &b in bins.iter() {
         start[b as usize + 1] += 1;
     }
     for i in 0..nb {
         start[i + 1] += start[i];
     }
-    tmp.clear();
-    tmp.reserve(n);
-    unsafe { tmp.set_len(n) };
+    out.clear();
+    out.reserve(n);
     let mut pos = start.clone();
-    for (x, &b) in v.iter().zip(&bins) {
-        let k = &mut pos[b as usize];
-        unsafe { *tmp.get_unchecked_mut(*k as usize) = *x };
-        *k += 1;
+    let mut j = 0;
+    for s in src {
+        for x in s.iter() {
+            let k = &mut pos[bins[j] as usize];
+            unsafe { out.as_mut_ptr().add(*k as usize).write(*x) };
+            *k += 1;
+            j += 1;
+        }
     }
-    std::mem::swap(v, tmp);
+    unsafe { out.set_len(n) };
     for i in 0..nb {
         let (a, b) = (start[i] as usize, start[i + 1] as usize);
         if b - a > 1 {
-            v[a..b].sort_unstable_by_key(|x| (p(x), t(x)));
+            out[a..b].sort_unstable_by_key(|x| (p(x), t(x)));
         }
     }
 }
