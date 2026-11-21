@@ -119,12 +119,124 @@ pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
 /// Quotes are only counted: a line is well quoted exactly when every field
 /// that starts with '"' also ends with one and those pairs are all its quotes.
 ///
-/// Two stages, both nearly branch-free: each 64-byte block's separator bits
-/// are flattened into entries (position | quotes-before << 32 | newline << 63),
-/// written 8 at a time whether or not they exist; then whole lines are taken
-/// from the entries, N at a time.
+/// Per batch of 64-byte blocks, the comma and newline bits are flattened into
+/// two position lists (8 writes at a time, whether or not they exist). A line
+/// is well formed when exactly N-1 commas lie before its newline; quotes are
+/// counted once per line from the blocks' quote masks.
 #[inline]
 pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    const B: usize = 16; // blocks per batch
+    let len = chunk.len();
+    assert!(len < (u32::MAX - 64) as usize, "chunk too large");
+    assert!(N >= 2 && N <= 16);
+    let mut cm = [0u32; 64 * B + 64 + 16 + 32]; // comma positions (+ unfinished line's)
+    let mut nlp = [0u32; 64 * B + 16]; // newline positions
+    let mut qm = [0u64; B]; // quote mask per block
+    let mut qb = [0u64; B]; // quotes before each block
+    let mut ccnt = 0usize;
+    let mut start = 0usize; // first byte of the current line
+    let mut q_line = 0u64; // quotes before the current line
+    let mut q_seen = 0u64; // quotes before `base`
+    let mut bad = false; // the unfinished line already has too many commas
+    let mut base = 0usize;
+    #[inline(always)]
+    fn flatten<const K: usize>(out: &mut [u32], mut idx: usize, base: usize, mut m: u64) -> usize {
+        let cnt = m.count_ones() as usize;
+        let end = idx + cnt;
+        loop {
+            for _ in 0..K {
+                debug_assert!(idx < out.len());
+                unsafe { *out.get_unchecked_mut(idx) = (base as u32).wrapping_add(m.trailing_zeros()) };
+                idx += 1;
+                m &= m.wrapping_sub(1);
+            }
+            if idx >= end {
+                return end;
+            }
+        }
+    }
+    loop {
+        let bbase = base;
+        let mut nb = 0usize;
+        let mut ncnt = 0usize;
+        while nb < B && base < len {
+            let (sep, nl, q) = if base + 64 <= len {
+                masks(chunk[base..base + 64].try_into().unwrap())
+            } else {
+                let mut buf = [0u8; 64];
+                buf[..len - base].copy_from_slice(&chunk[base..]);
+                masks(&buf)
+            };
+            ccnt = flatten::<8>(&mut cm, ccnt, base, sep & !nl);
+            ncnt = flatten::<2>(&mut nlp, ncnt, base, nl);
+            qm[nb] = q;
+            qb[nb] = q_seen;
+            q_seen += q.count_ones() as u64;
+            base += 64;
+            nb += 1;
+        }
+        let last = base >= len;
+        if last && len > 0 && chunk[len - 1] != 10 {
+            nlp[ncnt] = len as u32; // the last line may lack its '\n'
+            ncnt += 1;
+        }
+        for k in 0..N {
+            cm[ccnt + k] = u32::MAX;
+        }
+        let mut ci = 0usize;
+        for j in 0..ncnt {
+            let end = nlp[j] as usize;
+            let bi = (end - bbase) >> 6;
+            let cq = if bi < nb { qb[bi] + (qm[bi] & ((1u64 << ((end - bbase) & 63)) - 1)).count_ones() as u64 } else { q_seen };
+            if !bad && (cm[ci + N - 2] as usize) < end && cm[ci + N - 1] as usize > end {
+                let nq = cq - q_line;
+                let mut out: [&'a [u8]; N] = [&chunk[..0]; N];
+                let mut s = start;
+                let mut ok = 1u64;
+                let mut paired = 0u64;
+                for k in 0..N {
+                    let e = if k + 1 < N { cm[ci + k] as usize } else { end };
+                    let n = e - s;
+                    let c0 = unsafe { *chunk.get_unchecked(s.min(len - 1)) };
+                    let c1 = unsafe { *chunk.get_unchecked(e.max(1) - 1) };
+                    let q0 = ((n > 0) & (c0 == b'"')) as usize;
+                    let q1 = ((n >= 2) & (c1 == b'"')) as u64;
+                    ok &= (q0 as u64 ^ 1) | q1;
+                    paired += 2 * q0 as u64;
+                    let a = s + q0;
+                    out[k] = unsafe { chunk.get_unchecked(a..(e - q0).max(a)) };
+                    s = e + 1;
+                }
+                ci += N - 1;
+                if ok != 0 && paired == nq {
+                    f(out);
+                }
+            } else {
+                while (cm[ci] as usize) < end {
+                    ci += 1;
+                }
+                bad = false;
+            }
+            start = end + 1;
+            q_line = cq;
+        }
+        // commas of the unfinished line move to the front
+        let rest = ccnt - ci;
+        if rest >= N {
+            bad = true;
+            ccnt = 0;
+        } else {
+            cm.copy_within(ci..ccnt, 0);
+            ccnt = rest;
+        }
+        if last {
+            return;
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn for_each_record_v2<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     const NL: u64 = 1 << 63;
     const B: usize = 16; // blocks per batch
     const CAP: usize = 64 * B + 72 + 64;

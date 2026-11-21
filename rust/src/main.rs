@@ -411,7 +411,9 @@ fn main() {
         let h = sc.spawn(|| {
             let t = Instant::now();
             let r = people(&ln_chunks);
-            eprintln!("  (people {:.3}s)", t.elapsed().as_secs_f64());
+            if std::env::var_os("SS_VERBOSE").is_some() {
+                eprintln!("  (people {:.3}s)", t.elapsed().as_secs_f64());
+            }
             r
         });
         let copies = par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
@@ -798,6 +800,41 @@ fn main() {
     eprintln!("{:<10}{:7.3}s  ({} threads)", "total", t0.elapsed().as_secs_f64(), nt);
 }
 
+/// LSD radix sort by a u64 key, 8 bits per pass; passes where every key has
+/// the same byte are skipped. Stable.
+fn radix_sort<T: Copy + Default>(v: &mut Vec<T>, key: impl Fn(&T) -> u64) {
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let mut hist = vec![[0u32; 256]; 8];
+    for x in v.iter() {
+        let k = key(x);
+        for b in 0..8 {
+            hist[b][(k >> (8 * b)) as usize & 255] += 1;
+        }
+    }
+    let mut tmp: Vec<T> = vec![T::default(); n];
+    for b in 0..8 {
+        let h = &mut hist[b];
+        if h.iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let mut sum = 0u32;
+        for c in h.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for x in v.iter() {
+            let d = (key(x) >> (8 * b)) as usize & 255;
+            tmp[h[d] as usize] = *x;
+            h[d] += 1;
+        }
+        std::mem::swap(v, &mut tmp);
+    }
+}
+
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
         let g = parent[parent[x as usize] as usize];
@@ -810,6 +847,8 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
 /// Links -> union-find -> for every linked ID that does not name its person,
 /// ID code -> person code (the byte-wise smallest ID of the person).
 fn people<'a>(chunks: &[&'a [u8]]) -> (Table<u64>, Reg<'a>) {
+    let t0 = Instant::now();
+    let verbose = std::env::var_os("SS_VERBOSE").is_some();
     let mut cd = Coder::default();
     let mut edges: Vec<(u64, u64)> = Vec::new();
     for ch in chunks {
@@ -822,45 +861,68 @@ fn people<'a>(chunks: &[&'a [u8]]) -> (Table<u64>, Reg<'a>) {
             }
         });
     }
+    if verbose {
+        eprintln!("  (people parse {:.3}s)", t0.elapsed().as_secs_f64());
+    }
     let mut reg: Reg = HashMap::new();
     merge(&mut reg, cd);
-    let mut dense: Table<u32> = Table::new(edges.len() + 16);
+    // Dense IDs by sorting the endpoints: id order = code order, which is
+    // byte order for packed codes.
+    let m = edges.len();
+    let mut ends: Vec<(u64, u32)> = Vec::with_capacity(2 * m);
+    for (k, &(x, y)) in edges.iter().enumerate() {
+        ends.push((x, 2 * k as u32));
+        ends.push((y, 2 * k as u32 + 1));
+    }
+    drop(edges);
+    radix_sort(&mut ends, |e| e.0);
+    let mut id = vec![0u32; 2 * m];
     let mut codes: Vec<u64> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    for &(x, y) in &edges {
-        let mut ids = [0u32; 2];
-        for (k, c) in [x, y].into_iter().enumerate() {
-            let (i, f) = dense.slot(c);
-            ids[k] = if f {
-                dense.e[i].1
-            } else {
-                let n = codes.len() as u32;
-                dense.set(i, c, n);
-                codes.push(c);
-                parent.push(n);
-                n
-            };
+    for (k, &(c, slot)) in ends.iter().enumerate() {
+        if k == 0 || ends[k - 1].0 != c {
+            codes.push(c);
         }
-        let (ra, rb) = (find(&mut parent, ids[0]), find(&mut parent, ids[1]));
+        id[slot as usize] = codes.len() as u32 - 1;
+    }
+    drop(ends);
+    let nu = codes.len();
+    // union-find, linking the larger root under the smaller: every root is the
+    // smallest id (= smallest code) of its component
+    let mut parent: Vec<u32> = (0..nu as u32).collect();
+    for k in 0..m {
+        let (ra, rb) = (find(&mut parent, id[2 * k]), find(&mut parent, id[2 * k + 1]));
         if ra != rb {
             let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
             parent[hi as usize] = lo;
         }
     }
-    drop(dense);
-    let nu = codes.len();
-    let mut best: Vec<u64> = codes.clone(); // per root: smallest ID code
+    drop(id);
     let mut root = vec![0u32; nu];
     for u in 0..nu {
-        let r = find(&mut parent, u as u32);
-        root[u] = r;
-        if id_lt(codes[u], best[r as usize], &reg) {
-            best[r as usize] = codes[u];
+        root[u] = find(&mut parent, u as u32);
+    }
+    // Packed codes compare as bytes; fallback IDs need a byte-wise pass.
+    let mut best: Vec<u64> = (0..nu).map(|u| codes[root[u] as usize]).collect();
+    if !reg.is_empty() {
+        for u in 0..nu {
+            let r = root[u] as usize;
+            if id_lt(codes[u], best[r], &reg) {
+                best[r] = codes[u];
+            }
         }
+        for u in 0..nu {
+            best[u] = best[root[u] as usize];
+        }
+    }
+    if verbose {
+        eprintln!("  (people uf {:.3}s)", t0.elapsed().as_secs_f64());
     }
     let mut person: Table<u64> = Table::new(nu);
     for u in 0..nu {
-        let p = best[root[u] as usize];
+        if u + 16 < nu {
+            prefetch(&person.e, person.mask, codes[u + 16]);
+        }
+        let p = best[u];
         if p != codes[u] {
             let (i, _) = person.slot(codes[u]);
             person.set(i, codes[u], p);
