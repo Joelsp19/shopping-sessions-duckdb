@@ -440,6 +440,22 @@ fn main() {
         });
     }
     let ncamp = camp_ids.len();
+    // short campaign IDs (1..=7 bytes) as one integer in an open-addressing table
+    let mut camp_short: Table<u32> = Table::new(ncamp + 16);
+    for (i, id) in camp_ids.iter().enumerate() {
+        if let Some(k) = short_key(id) {
+            let (j, f) = camp_short.slot(k);
+            if !f {
+                camp_short.set(j, k, i as u32);
+            }
+        }
+    }
+    let camp_of = |c: &[u8]| -> Option<u32> {
+        match short_key(c) {
+            Some(k) => camp_short.get(k),
+            None => camp.get(&Key::new(c)).copied(),
+        }
+    };
     let ev_maps = map_dir(&data.join("events"), nt);
     let ck_maps = map_dir(&data.join("clicks"), nt);
     let ln_maps = map_dir(&data.join("links"), nt);
@@ -507,7 +523,13 @@ fn main() {
         merge(&mut reg, cd);
         ev_parts.push(b);
     }
-    let person_of = |u: u64| person.get(u).unwrap_or(u);
+    // linked users map to their person; everyone else names themselves
+    let person_of = |u: u64| {
+        let (i, f) = person.slot(u);
+        let v = unsafe { person.e.get_unchecked(i).1 };
+        let m = (f as u64).wrapping_neg();
+        (v & m) | (u & !m)
+    };
     lap("parse+ppl");
 
     // ---- one task pool: dedup each event bucket (earliest ingest wins, then
@@ -590,7 +612,7 @@ fn main() {
                     if cid.is_empty() || user.is_empty() {
                         return;
                     }
-                    let Some(&c) = camp.get(&Key::new(cmp)) else { return };
+                    let Some(c) = camp_of(cmp) else { return };
                     match ts_ms(ts) {
                         Some(x) if x >= cbase && x < we => {
                             pend.push(CkRec { p: cd.code(user), cid: cd.code(cid), t: (x - cbase) as u32, camp: c });
@@ -653,11 +675,6 @@ fn main() {
             let bits = bin_bits(ev_src.iter().map(|s| s.len()).sum());
             group_sort(&ev_src, &mut ev, &mut st.flat_ev, &mut st.sort, bits, |x| x.p, |x| x.t);
             group_sort(&ck_src, &mut ck, &mut st.flat_ck, &mut st.sort, bits, |x| x.p, |x| x.t);
-            if std::env::var("SS_NOLOOP").map_or(false, |v| !v.is_empty()) {
-                st.ev = ev;
-                st.ck = ck;
-                return;
-            }
 
             let mut catrev: Vec<(u32, i64)> = Vec::new();
             let mut ci = 0usize;
@@ -884,6 +901,18 @@ fn main() {
     eprintln!("{:<10}{:7.3}s  ({} threads)", "total", t0.elapsed().as_secs_f64(), nt);
     // outputs are written and closed; skip freeing everything else
     std::process::exit(0);
+}
+
+/// A 1..=7 byte string as one non-zero integer (bytes, length in the top byte).
+#[inline(always)]
+fn short_key(b: &[u8]) -> Option<u64> {
+    if b.is_empty() || b.len() > 7 {
+        return None;
+    }
+    let mut k = [0u8; 8];
+    k[..b.len()].copy_from_slice(b);
+    k[7] = b.len() as u8;
+    Some(u64::from_le_bytes(k))
 }
 
 /// Event type: 1 = view or cart, 2 = purchase, 0 = anything else.
