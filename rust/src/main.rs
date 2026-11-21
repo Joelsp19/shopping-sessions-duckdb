@@ -107,6 +107,16 @@ impl<V: Copy + Default> Table<V> {
     }
 }
 
+/// Hint the cache to load the slot where k's probe starts.
+#[inline(always)]
+fn prefetch<V>(e: &[(u64, V)], mask: usize, k: u64) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch::<_MM_HINT_T0>(e.as_ptr().add(mix(k) as usize & mask) as *const i8);
+    }
+}
+
 /// Linear probing over (key, value) slots; key 0 = empty. mask = len - 1.
 #[inline]
 fn probe<V>(e: &[(u64, V)], mask: usize, k: u64) -> (usize, bool) {
@@ -398,7 +408,12 @@ fn main() {
     let ev_chunks = chunks(&ev_maps);
     let ev_per = per(ev_bytes, 64);
     let ((person, link_reg), copies) = std::thread::scope(|sc| {
-        let h = sc.spawn(|| people(&ln_chunks));
+        let h = sc.spawn(|| {
+            let t = Instant::now();
+            let r = people(&ln_chunks);
+            eprintln!("  (people {:.3}s)", t.elapsed().as_secs_f64());
+            r
+        });
         let copies = par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
             for_each_record::<7>(ev_chunks[ci], |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -454,12 +469,13 @@ fn main() {
         best: Vec<ECopy>,
         ev: Vec<Vec<EvRec>>,
         ck: Vec<Vec<CkRec>>,
+        pend: Vec<CkRec>,
         cd: Coder<'a>,
     }
     let work = par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), cd: Coder::default() },
+        || Work { tab: Vec::new(), best: Vec::new(), ev: reserved(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default() },
         |st, task| {
             if task < NP {
                 let dp = task;
@@ -472,8 +488,13 @@ fn main() {
                 let mask = cap - 1;
                 let best = &mut st.best;
                 best.clear();
+                const AHEAD: usize = 16;
                 for w in &ev_parts {
-                    for c in &w[dp] {
+                    let src = &w[dp];
+                    for (k, c) in src.iter().enumerate() {
+                        if let Some(n) = src.get(k + AHEAD) {
+                            prefetch(tab, mask, n.eid);
+                        }
                         let (i, f) = probe(tab, mask, c.eid);
                         if f {
                             let b = &mut best[tab[i].1 as usize];
@@ -489,14 +510,29 @@ fn main() {
                 for x in tab.iter_mut() {
                     x.0 = 0;
                 }
-                for c in best.iter() {
+                for (k, c) in best.iter().enumerate() {
+                    if let Some(n) = best.get(k + AHEAD) {
+                        prefetch(&person.e, person.mask, n.user);
+                    }
                     if c.t != INVALID && c.ing - (ws + c.t as i64) <= DAY_MS {
                         let p = person_of(c.user);
                         st.ev[bucket(mix(p))].push(EvRec { p, t: c.t, pay: c.pay });
                     }
                 }
             } else {
-                let (bufs, cd) = (&mut st.ck, &mut st.cd);
+                // valid clicks are batched with p = user code, so the person
+                // lookups can be prefetched before they are resolved
+                let (bufs, cd, pend) = (&mut st.ck, &mut st.cd, &mut st.pend);
+                let flush = |pend: &mut Vec<CkRec>, bufs: &mut Vec<Vec<CkRec>>| {
+                    for r in pend.iter() {
+                        prefetch(&person.e, person.mask, r.p);
+                    }
+                    for r in pend.iter() {
+                        let p = person_of(r.p);
+                        bufs[bucket(mix(p))].push(CkRec { p, ..*r });
+                    }
+                    pend.clear();
+                };
                 for_each_record::<4>(ck_chunks[task - NP], |[cid, user, cmp, ts]| {
                     if cid.is_empty() || user.is_empty() {
                         return;
@@ -504,13 +540,15 @@ fn main() {
                     let Some(&c) = camp.get(&Key::new(cmp)) else { return };
                     match ts_ms(ts) {
                         Some(x) if x >= cbase && x < we => {
-                            let p = person_of(cd.code(user));
-                            let cid = cd.code(cid);
-                            bufs[bucket(mix(p))].push(CkRec { p, cid, t: (x - cbase) as u32, camp: c });
+                            pend.push(CkRec { p: cd.code(user), cid: cd.code(cid), t: (x - cbase) as u32, camp: c });
+                            if pend.len() == 32 {
+                                flush(pend, bufs);
+                            }
                         }
                         _ => {}
                     }
                 });
+                flush(pend, bufs);
             }
         },
     );
