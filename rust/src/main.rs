@@ -708,6 +708,10 @@ fn main() {
     let mut order: Vec<usize> = (0..NP).collect();
     let size = |q: usize| -> usize { evs.iter().map(|s| s[q].len()).sum::<usize>() + cks.iter().map(|s| s[q].len()).sum::<usize>() };
     order.sort_by_cached_key(|&q| std::cmp::Reverse(size(q)));
+    if std::env::var_os("SS_VERBOSE").is_some() {
+        let tot: usize = (0..NP).map(size).sum();
+        eprintln!("  (buckets max {} {} {} mean {})", size(order[0]), size(order[1]), size(order[2]), tot / NP);
+    }
     // ---- outputs: each thread writes its user_daily part as soon as it runs
     // ---- out of sweep work
     let ud = outd.join("user_daily");
@@ -1000,61 +1004,88 @@ fn sub_bin(p: u64, bits: u32) -> usize {
     (mix(p) >> (56 - bits)) as usize & ((1 << bits) - 1)
 }
 
-/// Bin bits for a bucket of n records: ~8 bins per record, so two persons
-/// rarely share a bin.
+/// Bin bits for a bucket of n records: ~4 records per bin, so a bin is
+/// sorted in a few compares and its counters stay in cache.
 fn bin_bits(n: usize) -> u32 {
-    (n.max(1).ilog2() + 3).clamp(4, 23)
+    (n.max(1).ilog2().saturating_sub(2)).clamp(4, 23)
 }
 
 /// Scratch space for group_sort, reused across buckets.
 #[derive(Default)]
 struct SortScratch {
-    keys: Vec<(u64, u32)>,
-    tmp: Vec<(u64, u32)>,
+    hist: Vec<u32>,
 }
 
 /// Gathers the source slices into `out`, ordered by (sub_bin(person), person,
-/// time): an LSD radix sort on (bin << 32 | time), then any bin that holds more
-/// than one person is stably re-sorted by person (time order is kept).
+/// time): one counting scatter by bin, then each (small) bin sorted by
+/// (person, time). Order among equal (person, time) is unspecified.
 fn group_sort<T: Copy>(
     src: &[&[T]],
     out: &mut Vec<T>,
-    flat: &mut Vec<T>,
+    _flat: &mut Vec<T>,
     sc: &mut SortScratch,
     bits: u32,
     p: impl Fn(&T) -> u64,
     t: impl Fn(&T) -> u32,
 ) {
-    flat.clear();
+    let nb = 1usize << bits;
+    let n: usize = src.iter().map(|s| s.len()).sum();
+    let h = &mut sc.hist;
+    h.clear();
+    h.resize(nb + 1, 0);
     for s in src {
-        flat.extend_from_slice(s);
+        for x in s.iter() {
+            unsafe { *h.get_unchecked_mut(sub_bin(p(x), bits) + 1) += 1 };
+        }
     }
-    let n = flat.len();
-    sc.keys.clear();
-    sc.keys.extend(flat.iter().enumerate().map(|(i, x)| ((sub_bin(p(x), bits) as u64) << 32 | t(x) as u64, i as u32)));
-    radix11(&mut sc.keys, &mut sc.tmp, bits + 32);
+    for i in 0..nb {
+        h[i + 1] += h[i];
+    }
+    // h[b] = start of bin b; scatter advances h[b] to the start of bin b+1
     out.clear();
-    out.extend(sc.keys.iter().map(|&(_, i)| unsafe { *flat.get_unchecked(i as usize) }));
-    let mut a = 0;
-    while a < n {
-        let bin = sc.keys[a].0 >> 32;
-        let p0 = p(&out[a]);
-        let mut b = a + 1;
-        let mut mixed = false;
-        while b < n && sc.keys[b].0 >> 32 == bin {
-            mixed |= p(&out[b]) != p0;
-            b += 1;
+    out.reserve(n);
+    let dst = out.as_mut_ptr();
+    for s in src {
+        for x in s.iter() {
+            unsafe {
+                let c = h.get_unchecked_mut(sub_bin(p(x), bits));
+                dst.add(*c as usize).write(*x);
+                *c += 1;
+            }
         }
-        if mixed {
-            out[a..b].sort_by_key(|x| p(x)); // stable
+    }
+    unsafe { out.set_len(n) };
+    // now h[b] = end of bin b
+    let key = |x: &T| ((p(x) as u128) << 32) | t(x) as u128;
+    let mut a = 0usize;
+    for b in 0..nb {
+        let e = h[b] as usize;
+        let len = e - a;
+        if len > 1 {
+            let g = &mut out[a..e];
+            if len <= 24 {
+                for i in 1..len {
+                    let v = g[i];
+                    let kv = key(&v);
+                    let mut j = i;
+                    while j > 0 && key(&g[j - 1]) > kv {
+                        g[j] = g[j - 1];
+                        j -= 1;
+                    }
+                    g[j] = v;
+                }
+            } else {
+                g.sort_unstable_by_key(|x| key(x));
+            }
         }
-        a = b;
+        a = e;
     }
 }
 
 /// LSD radix sort of (key, index) pairs by the low 55 bits of the key, 11 bits
 /// per pass (histograms stay in L1); passes where every key has the same digit
 /// are skipped. Stable.
+#[allow(dead_code)]
 fn radix11(v: &mut Vec<(u64, u32)>, tmp: &mut Vec<(u64, u32)>, bits: u32) {
     const P: usize = 5;
     debug_assert!(bits <= 55);
