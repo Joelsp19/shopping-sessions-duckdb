@@ -1014,6 +1014,51 @@ fn bin_bits(n: usize) -> u32 {
 #[derive(Default)]
 struct SortScratch {
     hist: Vec<u32>,
+    tmp: Vec<u8>,
+}
+
+/// LSD radix sort of records by their 32-bit time (3 passes of 11 bits;
+/// a pass where every record has the same digit is skipped).
+fn radix_t<T: Copy>(g: &mut [T], tmp: &mut Vec<u8>, t: &impl Fn(&T) -> u32) {
+    let n = g.len();
+    let need = n * std::mem::size_of::<T>() + std::mem::align_of::<T>();
+    if tmp.len() < need {
+        tmp.resize(need, 0);
+    }
+    let off = tmp.as_ptr().align_offset(std::mem::align_of::<T>());
+    let b: &mut [T] = unsafe { std::slice::from_raw_parts_mut(tmp.as_mut_ptr().add(off) as *mut T, n) };
+    let mut hist = [[0u32; 2048]; 3];
+    for x in g.iter() {
+        let k = t(x);
+        hist[0][(k & 2047) as usize] += 1;
+        hist[1][(k >> 11 & 2047) as usize] += 1;
+        hist[2][(k >> 22) as usize] += 1;
+    }
+    let (mut src, mut dst): (&mut [T], &mut [T]) = (g, b);
+    let mut in_g = true;
+    for d in 0..3 {
+        let h = &mut hist[d];
+        let sh = 11 * d as u32;
+        if h[((t(&src[0]) >> sh) & 2047) as usize] as usize == n {
+            continue;
+        }
+        let mut sum = 0u32;
+        for c in h.iter_mut() {
+            let x = *c;
+            *c = sum;
+            sum += x;
+        }
+        for x in src.iter() {
+            let c = &mut h[((t(x) >> sh) & 2047) as usize];
+            unsafe { *dst.get_unchecked_mut(*c as usize) = *x };
+            *c += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        in_g = !in_g;
+    }
+    if !in_g {
+        dst.copy_from_slice(src);
+    }
 }
 
 /// Gathers the source slices into `out`, ordered by (sub_bin(person), person,
@@ -1074,6 +1119,8 @@ fn group_sort<T: Copy>(
                     }
                     g[j] = v;
                 }
+            } else if len >= 256 && g.iter().all(|x| p(x) == p(&g[0])) {
+                radix_t(g, &mut sc.tmp, &t);
             } else {
                 g.sort_unstable_by_key(|x| key(x));
             }
