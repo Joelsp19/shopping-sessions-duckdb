@@ -219,7 +219,8 @@ fn map_file(p: &Path) -> Option<Mmap> {
     if f.metadata().ok()?.len() == 0 {
         return None;
     }
-    let m = unsafe { Mmap::map(&f).ok()? };
+    // populate: map every page up front in one call instead of one fault per page
+    let m = unsafe { memmap2::MmapOptions::new().populate().map(&f).ok()? };
     #[cfg(unix)]
     let _ = m.advise(memmap2::Advice::Sequential);
     Some(m)
@@ -328,6 +329,8 @@ struct Sweep {
     rows: Vec<URow>,
     ev: Vec<EvRec>,
     ck: Vec<CkRec>,
+    tmp_ev: Vec<EvRec>,
+    tmp_ck: Vec<CkRec>,
 }
 
 fn main() {
@@ -400,13 +403,13 @@ fn main() {
     // slack); a reservation is only address space until it is written.
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
-    let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 3 / 2 + 16;
+    let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 6 / 5 + 64;
 
     // ---- people (one thread: links -> union-find -> person codes) while
     // ---- every core parses events: validate each copy, bucket by hash(event_id)
     let ln_chunks = chunks(&ln_maps);
     let ev_chunks = chunks(&ev_maps);
-    let ev_per = per(ev_bytes, 64);
+    let ev_per = per(ev_bytes, 76);
     let ((person, link_reg), copies) = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
             let t = Instant::now();
@@ -465,7 +468,7 @@ fn main() {
     // ---- and scatter by hash(person). Tables and buffers are reused per thread.
     let ck_chunks = chunks(&ck_maps);
     let cbase = ws - WEEK;
-    let (evo_per, cko_per) = (per(ev_bytes, 64), per(ck_bytes, 40));
+    let (evo_per, cko_per) = (per(ev_bytes, 76), per(ck_bytes, 44));
     struct Work<'a> {
         tab: Vec<(u64, u32)>,
         best: Vec<ECopy>,
@@ -586,6 +589,8 @@ fn main() {
             rows: Vec::new(),
             ev: Vec::new(),
             ck: Vec::new(),
+            tmp_ev: Vec::new(),
+            tmp_ck: Vec::new(),
         },
         |st, task| {
             let q = order[task];
@@ -596,11 +601,12 @@ fn main() {
             for s in &evs {
                 ev.extend_from_slice(&s[q]);
             }
-            ev.sort_unstable_by_key(|x| (x.p, x.t));
+            let bits = bin_bits(ev.len());
+            group_sort(&mut ev, &mut st.tmp_ev, bits, |x| x.p, |x| x.t);
             for s in &cks {
                 ck.extend_from_slice(&s[q]);
             }
-            ck.sort_unstable_by_key(|x| (x.p, x.t));
+            group_sort(&mut ck, &mut st.tmp_ck, bits, |x| x.p, |x| x.t);
 
             let mut catrev: Vec<(u32, i64)> = Vec::new();
             let mut ci = 0usize;
@@ -611,7 +617,8 @@ fn main() {
                 while j < ev.len() && ev[j].p == p {
                     j += 1;
                 }
-                while ci < ck.len() && ck[ci].p < p {
+                let op = (sub_bin(p, bits), p);
+                while ci < ck.len() && (sub_bin(ck[ci].p, bits), ck[ci].p) < op {
                     ci += 1;
                 }
                 let c0 = ci;
@@ -804,6 +811,52 @@ fn main() {
     );
     lap("write");
     eprintln!("{:<10}{:7.3}s  ({} threads)", "total", t0.elapsed().as_secs_f64(), nt);
+}
+
+/// Bin of a person code inside its bucket: `bits` bits just below the bucket's.
+#[inline]
+fn sub_bin(p: u64, bits: u32) -> usize {
+    (mix(p) >> (56 - bits)) as usize & ((1 << bits) - 1)
+}
+
+/// Bin bits for a bucket of n records (~16 records per bin).
+fn bin_bits(n: usize) -> u32 {
+    ((n / 16).max(1).ilog2() + 1).clamp(4, 16)
+}
+
+/// Orders records by (sub_bin(person), person, time): one counting-sort pass
+/// on the bin, then a small sort of each bin (a bin holds ~1 person; persons
+/// sharing a bin are still separated by the (person, time) sort).
+fn group_sort<T: Copy>(v: &mut Vec<T>, tmp: &mut Vec<T>, bits: u32, p: impl Fn(&T) -> u64, t: impl Fn(&T) -> u32) {
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let nb = 1usize << bits;
+    let mut start = vec![0u32; nb + 1];
+    let bins: Vec<u16> = v.iter().map(|x| sub_bin(p(x), bits) as u16).collect();
+    for &b in &bins {
+        start[b as usize + 1] += 1;
+    }
+    for i in 0..nb {
+        start[i + 1] += start[i];
+    }
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut pos = start.clone();
+    for (x, &b) in v.iter().zip(&bins) {
+        let k = &mut pos[b as usize];
+        unsafe { *tmp.get_unchecked_mut(*k as usize) = *x };
+        *k += 1;
+    }
+    std::mem::swap(v, tmp);
+    for i in 0..nb {
+        let (a, b) = (start[i] as usize, start[i + 1] as usize);
+        if b - a > 1 {
+            v[a..b].sort_unstable_by_key(|x| (p(x), t(x)));
+        }
+    }
 }
 
 /// LSD radix sort by a u64 key, 8 bits per pass; passes where every key has
