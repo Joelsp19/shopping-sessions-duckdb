@@ -19,6 +19,7 @@ def build_sessions(con, ws_ms):
         CREATE OR REPLACE TEMP TABLE ev AS
         SELECT m.pid, e.t::BIGINT AS t, e.price, e.cat FROM events e JOIN pid_map m USING (uid)
     """)
+    con.execute("DROP TABLE events")
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE ts_start AS
         WITH g AS (
@@ -45,3 +46,4 @@ def build_sessions(con, ws_ms):
         FROM ev e JOIN ts_start s USING (pid, t)
         WHERE e.price > 0
     """)
+    con.execute("DROP TABLE ev; DROP TABLE ts_start")

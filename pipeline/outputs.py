@@ -15,6 +15,7 @@ def build_outputs(con, out_dir):
         CREATE OR REPLACE TEMP TABLE pclicks AS
         SELECT m.pid, c.t, c.camp, c.click_id FROM clicks c JOIN pid_map m USING (uid)
     """)
+    con.execute("DROP TABLE clicks; DROP TABLE pid_map")
     con.execute("""
         CREATE OR REPLACE TEMP TABLE credit_clicks AS
         SELECT pid, t, arg_min(camp, click_id) AS camp FROM pclicks GROUP BY pid, t
@@ -28,13 +29,34 @@ def build_outputs(con, out_dir):
         FROM sessions s ASOF LEFT JOIN credit_clicks c ON s.pid = c.pid AND s.start >= c.t
     """)
 
+    con.execute("DROP TABLE credit_clicks")
+
     # Assists: every campaign with a click in [start - 7d, start], once per session.
+    # Each click covers session starts in [t, t + 7d]. Merging a (person,
+    # campaign)'s overlapping intervals into disjoint islands means a session
+    # matches at most one island per campaign: no DISTINCT needed, and whale
+    # users' tens of thousands of clicks collapse to a few islands per campaign.
+    # Click times are made DISTINCT first so the window order is deterministic
+    # (with ties, the two windows could order rows differently and stretch an
+    # island across a gap; the exactness test caught that).
     con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE assists AS
-        SELECT DISTINCT s.pid, s.start, s.day, c.camp
-        FROM sessions s JOIN pclicks c
-          ON c.pid = s.pid AND c.t BETWEEN s.start - {WEEK_MS} AND s.start
+        CREATE OR REPLACE TEMP TABLE assists_daily AS
+        WITH b AS (
+            SELECT pid, camp, t,
+                   coalesce(t - lag(t) OVER (PARTITION BY pid, camp ORDER BY t) > {WEEK_MS}, true)::INT AS brk
+            FROM (SELECT DISTINCT pid, camp, t FROM pclicks)
+        ), g AS (
+            SELECT pid, camp, t,
+                   sum(brk) OVER (PARTITION BY pid, camp ORDER BY t ROWS UNBOUNDED PRECEDING) AS grp
+            FROM b
+        ), isl AS (
+            SELECT pid, camp, min(t) AS lo, max(t) + {WEEK_MS} AS hi FROM g GROUP BY pid, camp, grp
+        )
+        SELECT i.camp, s.day, count(*) AS assisted_sessions
+        FROM sessions s JOIN isl i ON i.pid = s.pid AND s.start BETWEEN i.lo AND i.hi
+        GROUP BY ALL
     """)
+    con.execute("DROP TABLE pclicks")
 
     user_daily = """
         WITH cat_rev AS (
@@ -58,7 +80,7 @@ def build_outputs(con, out_dir):
                    sum(revenue) AS revenue_cents
             FROM credited GROUP BY ALL
         ), asst AS (
-            SELECT camp, day, count(*) AS assisted_sessions FROM assists GROUP BY ALL
+            SELECT camp, day, assisted_sessions FROM assists_daily
         ), j AS (
             SELECT coalesce(cr.camp, asst.camp) AS camp, coalesce(cr.day, asst.day) AS day,
                    coalesce(cr.sessions, 0) AS sessions,

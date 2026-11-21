@@ -40,3 +40,5 @@ def encode(con):
         SELECT u.uid, c.click_id, c.camp, c.t
         FROM clicks_clean c JOIN user_ids u USING (user_id)
     """)
+    # The string-keyed tables are no longer needed: free their memory now.
+    con.execute("DROP TABLE links_raw; DROP TABLE events_clean; DROP TABLE clicks_clean; DROP TABLE products")

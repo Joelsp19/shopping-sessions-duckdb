@@ -25,5 +25,7 @@ def build_people(con):
     _, labels = connected_components(g, directed=False)
     # uids are 0..n-1 ascending, so the first uid seen with each label is its minimum.
     _, first = np.unique(labels, return_index=True)
-    pid_map = {"uid": np.arange(n, dtype=np.uint32), "pid": first[labels].astype(np.uint32)}  # noqa: F841
-    con.execute("CREATE OR REPLACE TEMP TABLE pid_map AS SELECT uid, pid FROM pid_map")
+    con.register("pid_map_np", {"uid": np.arange(n, dtype=np.uint32), "pid": first[labels].astype(np.uint32)})
+    con.execute("CREATE OR REPLACE TEMP TABLE pid_map AS SELECT uid, pid FROM pid_map_np")
+    con.unregister("pid_map_np")
+    con.execute("DROP TABLE links")
