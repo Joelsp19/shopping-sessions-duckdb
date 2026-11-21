@@ -344,7 +344,9 @@ struct Sweep {
     rows: Vec<URow>,
     ev: Vec<EvRec>,
     ck: Vec<CkRec>,
-    bins: Vec<u16>,
+    flat_ev: Vec<EvRec>,
+    flat_ck: Vec<CkRec>,
+    sort: SortScratch,
 }
 
 fn main() {
@@ -370,6 +372,7 @@ fn main() {
     let ws = ts_ms(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
     let we = ts_ms(json_str(&manifest, "window_end").as_bytes()).expect("window_end");
     assert!(we > ws && we - ws + WEEK < INVALID as i64, "window too long for 32-bit offsets");
+    assert!(we - ws + WEEK < 1 << 32, "times must fit the sort keys' low 32 bits");
     let d0 = ws.div_euclid(DAY_MS);
     let nd = ((we - 1).div_euclid(DAY_MS) - d0 + 1) as usize;
 
@@ -464,7 +467,7 @@ fn main() {
         });
         let copies = par(nt, ev_chunks.len(), || (reserved(ev_per), Coder::default()), |(bufs, cd), ci| {
             populate(ev_chunks[ci]);
-            for_each_record::<7>(ev_chunks[ci], |[eid, user, ts, ing, ty, pr_id, pr]| {
+            for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
                     return;
                 }
@@ -583,7 +586,7 @@ fn main() {
                     pend.clear();
                 };
                 populate(ck_chunks[task - NP]);
-                for_each_record::<4>(ck_chunks[task - NP], |[cid, user, cmp, ts]| {
+                for_each_record::<4>(ck_chunks[task - NP], #[inline(always)] |[cid, user, cmp, ts]| {
                     if cid.is_empty() || user.is_empty() {
                         return;
                     }
@@ -635,7 +638,9 @@ fn main() {
             rows: Vec::new(),
             ev: Vec::new(),
             ck: Vec::new(),
-            bins: Vec::new(),
+            flat_ev: Vec::new(),
+            flat_ck: Vec::new(),
+            sort: SortScratch::default(),
         },
         |st, task| {
             let q = order[task];
@@ -646,8 +651,13 @@ fn main() {
             let ev_src: Vec<&[EvRec]> = evs.iter().map(|s| &s[q][..]).collect();
             let ck_src: Vec<&[CkRec]> = cks.iter().map(|s| &s[q][..]).collect();
             let bits = bin_bits(ev_src.iter().map(|s| s.len()).sum());
-            group_sort(&ev_src, &mut ev, &mut st.bins, bits, |x| x.p, |x| x.t);
-            group_sort(&ck_src, &mut ck, &mut st.bins, bits, |x| x.p, |x| x.t);
+            group_sort(&ev_src, &mut ev, &mut st.flat_ev, &mut st.sort, bits, |x| x.p, |x| x.t);
+            group_sort(&ck_src, &mut ck, &mut st.flat_ck, &mut st.sort, bits, |x| x.p, |x| x.t);
+            if std::env::var("SS_NOLOOP").map_or(false, |v| !v.is_empty()) {
+                st.ev = ev;
+                st.ck = ck;
+                return;
+            }
 
             let mut catrev: Vec<(u32, i64)> = Vec::new();
             let mut ci = 0usize;
@@ -895,48 +905,102 @@ fn sub_bin(p: u64, bits: u32) -> usize {
     (mix(p) >> (56 - bits)) as usize & ((1 << bits) - 1)
 }
 
-/// Bin bits for a bucket of n records (~16 records per bin).
+/// Bin bits for a bucket of n records: ~8 bins per record, so two persons
+/// rarely share a bin.
 fn bin_bits(n: usize) -> u32 {
-    ((n / 16).max(1).ilog2() + 1).clamp(4, 16)
+    (n.max(1).ilog2() + 3).clamp(4, 23)
+}
+
+/// Scratch space for group_sort, reused across buckets.
+#[derive(Default)]
+struct SortScratch {
+    keys: Vec<(u64, u32)>,
+    tmp: Vec<(u64, u32)>,
 }
 
 /// Gathers the source slices into `out`, ordered by (sub_bin(person), person,
-/// time): one counting-sort pass on the bin straight from the sources, then a
-/// small sort of each bin (a bin holds ~1 person; persons sharing a bin are
-/// still separated by the (person, time) sort).
-fn group_sort<T: Copy>(src: &[&[T]], out: &mut Vec<T>, bins: &mut Vec<u16>, bits: u32, p: impl Fn(&T) -> u64, t: impl Fn(&T) -> u32) {
-    let n: usize = src.iter().map(|s| s.len()).sum();
-    let nb = 1usize << bits;
-    let mut start = vec![0u32; nb + 1];
-    bins.clear();
+/// time): an LSD radix sort on (bin << 32 | time), then any bin that holds more
+/// than one person is stably re-sorted by person (time order is kept).
+fn group_sort<T: Copy>(
+    src: &[&[T]],
+    out: &mut Vec<T>,
+    flat: &mut Vec<T>,
+    sc: &mut SortScratch,
+    bits: u32,
+    p: impl Fn(&T) -> u64,
+    t: impl Fn(&T) -> u32,
+) {
+    flat.clear();
     for s in src {
-        bins.extend(s.iter().map(|x| sub_bin(p(x), bits) as u16));
+        flat.extend_from_slice(s);
     }
-    for &b in bins.iter() {
-        start[b as usize + 1] += 1;
-    }
-    for i in 0..nb {
-        start[i + 1] += start[i];
-    }
+    let n = flat.len();
+    sc.keys.clear();
+    sc.keys.extend(flat.iter().enumerate().map(|(i, x)| ((sub_bin(p(x), bits) as u64) << 32 | t(x) as u64, i as u32)));
+    radix11(&mut sc.keys, &mut sc.tmp, bits + 32);
     out.clear();
-    out.reserve(n);
-    let mut pos = start.clone();
-    let mut j = 0;
-    for s in src {
-        for x in s.iter() {
-            let k = &mut pos[bins[j] as usize];
-            unsafe { out.as_mut_ptr().add(*k as usize).write(*x) };
-            *k += 1;
-            j += 1;
+    out.extend(sc.keys.iter().map(|&(_, i)| unsafe { *flat.get_unchecked(i as usize) }));
+    let mut a = 0;
+    while a < n {
+        let bin = sc.keys[a].0 >> 32;
+        let p0 = p(&out[a]);
+        let mut b = a + 1;
+        let mut mixed = false;
+        while b < n && sc.keys[b].0 >> 32 == bin {
+            mixed |= p(&out[b]) != p0;
+            b += 1;
+        }
+        if mixed {
+            out[a..b].sort_by_key(|x| p(x)); // stable
+        }
+        a = b;
+    }
+}
+
+/// LSD radix sort of (key, index) pairs by the low 55 bits of the key, 11 bits
+/// per pass (histograms stay in L1); passes where every key has the same digit
+/// are skipped. Stable.
+fn radix11(v: &mut Vec<(u64, u32)>, tmp: &mut Vec<(u64, u32)>, bits: u32) {
+    const P: usize = 5;
+    debug_assert!(bits <= 55);
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    let mut hist = [[0u32; 2048]; P];
+    for &(k, _) in v.iter() {
+        unsafe {
+            *hist[0].get_unchecked_mut((k & 2047) as usize) += 1;
+            *hist[1].get_unchecked_mut((k >> 11 & 2047) as usize) += 1;
+            *hist[2].get_unchecked_mut((k >> 22 & 2047) as usize) += 1;
+            *hist[3].get_unchecked_mut((k >> 33 & 2047) as usize) += 1;
+            *hist[4].get_unchecked_mut((k >> 44 & 2047) as usize) += 1;
         }
     }
-    unsafe { out.set_len(n) };
-    for i in 0..nb {
-        let (a, b) = (start[i] as usize, start[i + 1] as usize);
-        if b - a > 1 {
-            let g = &mut out[a..b];
-            g.sort_unstable_by_key(|x| (p(x), t(x)));
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    for d in 0..P {
+        let h = &mut hist[d];
+        let sh = 11 * d as u32;
+        if h[((v[0].0 >> sh) & 2047) as usize] as usize == n {
+            continue;
         }
+        let mut sum = 0u32;
+        for c in h.iter_mut() {
+            let x = *c;
+            *c = sum;
+            sum += x;
+        }
+        let dst = tmp.as_mut_ptr();
+        for &x in v.iter() {
+            unsafe {
+                let c = h.get_unchecked_mut(((x.0 >> sh) & 2047) as usize);
+                dst.add(*c as usize).write(x);
+                *c += 1;
+            }
+        }
+        std::mem::swap(v, tmp);
     }
 }
 
@@ -992,7 +1056,7 @@ fn people<'a>(chunks: &[&'a [u8]]) -> (Table<u64>, Reg<'a>) {
     let mut cd = Coder::default();
     let mut edges: Vec<(u64, u64)> = Vec::new();
     for ch in chunks {
-        for_each_record::<2>(ch, |[a, b]| {
+        for_each_record::<2>(ch, #[inline(always)] |[a, b]| {
             if !a.is_empty() && !b.is_empty() {
                 let (x, y) = (cd.code(a), cd.code(b));
                 if x != y {
