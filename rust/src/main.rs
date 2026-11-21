@@ -1084,15 +1084,6 @@ fn radix11(v: &mut Vec<(u64, u32)>, tmp: &mut Vec<(u64, u32)>, bits: u32) {
     }
 }
 
-fn find(parent: &mut [u32], mut x: u32) -> u32 {
-    while parent[x as usize] != x {
-        let g = parent[parent[x as usize] as usize];
-        parent[x as usize] = g;
-        x = g;
-    }
-    x
-}
-
 /// Links -> union-find -> for every linked ID that does not name its person,
 /// ID code -> person code (the byte-wise smallest ID of the person).
 /// A raw pointer that may be shared across the worker threads; every use
@@ -1243,26 +1234,56 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (Table<u64>, Reg<'a>) {
     }
     std::thread::spawn(move || drop((edges, ends)));
 
-    // 4. union-find, linking the larger root under the smaller: every root is
-    // the smallest id (= smallest code) of its component
-    let mut parent: Vec<u32> = (0..nu as u32).collect();
-    for k in 0..m {
-        let (ra, rb) = (find(&mut parent, id[2 * k]), find(&mut parent, id[2 * k + 1]));
-        if ra != rb {
-            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
-            parent[hi as usize] = lo;
+    // 4. union-find on all threads, lock-free: a root is only ever linked
+    // under a smaller one, by a compare-and-swap that fails if it stopped being
+    // a root (then the union retries). Links only point to smaller ids, so
+    // every root is the smallest id (= smallest code) of its component.
+    // Path halving only ever points a node at one of its ancestors.
+    use std::sync::atomic::AtomicU32;
+    let parent: Vec<AtomicU32> = (0..nu as u32).map(AtomicU32::new).collect();
+    #[inline(always)]
+    fn cfind(p: &[AtomicU32], mut x: u32) -> u32 {
+        loop {
+            let px = p[x as usize].load(Ordering::Acquire);
+            if px == x {
+                return x;
+            }
+            let gx = p[px as usize].load(Ordering::Acquire);
+            if gx != px {
+                p[x as usize].store(gx, Ordering::Release);
+            }
+            x = gx;
         }
     }
+    let par_n = nt.max(1) * 8;
+    par(nt, par_n, || (), |_, r| {
+        for k in r * m / par_n..(r + 1) * m / par_n {
+            let (a, b) = (id[2 * k], id[2 * k + 1]);
+            loop {
+                let (ra, rb) = (cfind(&parent, a), cfind(&parent, b));
+                if ra == rb {
+                    break;
+                }
+                let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                if parent[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    break;
+                }
+            }
+        }
+    });
     lapv("uf");
     // roots, read-only and in parallel
     let mut root: Vec<u32> = Vec::with_capacity(nu);
     let rp = SharedPtr(root.as_mut_ptr());
-    let par_n = nt.max(1) * 8;
     par(nt, par_n, || (), |_, r| {
         for u in r * nu / par_n..(r + 1) * nu / par_n {
             let mut x = u as u32;
-            while parent[x as usize] != x {
-                x = parent[x as usize];
+            loop {
+                let px = parent[x as usize].load(Ordering::Relaxed);
+                if px == x {
+                    break;
+                }
+                x = px;
             }
             unsafe { rp.write(u, x) };
         }
