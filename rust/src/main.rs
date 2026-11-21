@@ -567,6 +567,11 @@ fn main() {
     // ---- per person sweep: sessions, user_daily, credit, assists
     let w = (ncamp + 1) * nd;
     let reg = &reg;
+    // Biggest buckets first: a bucket holding a very active person can take
+    // several times the average, and must not be the last one picked up.
+    let mut order: Vec<usize> = (0..NP).collect();
+    let size = |q: usize| -> usize { evs.iter().map(|s| s[q].len()).sum::<usize>() + cks.iter().map(|s| s[q].len()).sum::<usize>() };
+    order.sort_by_cached_key(|&q| std::cmp::Reverse(size(q)));
     let sweeps: Vec<Sweep> = par(
         nt,
         NP,
@@ -582,7 +587,8 @@ fn main() {
             ev: Vec::new(),
             ck: Vec::new(),
         },
-        |st, q| {
+        |st, task| {
+            let q = order[task];
             let mut ev = std::mem::take(&mut st.ev);
             let mut ck = std::mem::take(&mut st.ck);
             ev.clear();
