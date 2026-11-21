@@ -209,6 +209,39 @@ fn par<S: Send>(nt: usize, n: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mu
     })
 }
 
+/// `par`, plus `fin(state, thread)` run by each thread as soon as it finds no
+/// more tasks (while other threads may still be working).
+fn par_fin<S: Send>(
+    nt: usize,
+    n: usize,
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, usize) + Sync,
+    fin: impl Fn(&mut S, usize) + Sync,
+) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    let nt = nt.max(1).min(n.max(1));
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nt)
+            .map(|t| {
+                let (next, init, f, fin) = (&next, &init, &f, &fin);
+                sc.spawn(move || {
+                    let mut s = init();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        f(&mut s, i);
+                    }
+                    fin(&mut s, t);
+                    s
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 fn reserved<T>(n: usize) -> Vec<Vec<T>> {
     (0..NP).map(|_| Vec::with_capacity(n)).collect()
 }
@@ -351,6 +384,18 @@ struct Sweep {
 
 fn main() {
     let t0 = Instant::now();
+    #[cfg(target_os = "linux")]
+    if std::env::var("SS_NOMALLOPT").map_or(true, |v| v.is_empty()) {
+        // keep freed buffers in the heap (no trim, mmap only above 32 MB), so
+        // later phases reuse pages instead of faulting in fresh zeroed ones
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        unsafe {
+            mallopt(-1, i32::MAX); // M_TRIM_THRESHOLD
+            mallopt(-3, 32 << 20); // M_MMAP_THRESHOLD
+        }
+    }
     let mut last = Instant::now();
     let stop_after = std::env::var("SS_STOP").unwrap_or_default();
     let mut lap = |name: &str| {
@@ -649,7 +694,59 @@ fn main() {
     let mut order: Vec<usize> = (0..NP).collect();
     let size = |q: usize| -> usize { evs.iter().map(|s| s[q].len()).sum::<usize>() + cks.iter().map(|s| s[q].len()).sum::<usize>() };
     order.sort_by_cached_key(|&q| std::cmp::Reverse(size(q)));
-    let sweeps: Vec<Sweep> = par(
+    // ---- outputs: each thread writes its user_daily part as soon as it runs
+    // ---- out of sweep work
+    let ud = outd.join("user_daily");
+    let cd = outd.join("campaign_daily");
+    std::fs::create_dir_all(&ud).expect("mkdir user_daily");
+    std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
+    let cat_bytes: Vec<ByteArray> = cat_names.iter().map(|c| ByteArray::from(c.to_vec())).collect();
+    let write_part = |rows: &Vec<URow>, k: usize| {
+        let mut top_v = Vec::new();
+        let mut top_d = Vec::with_capacity(rows.len());
+        for r in rows {
+            if r.top == NO_CAT {
+                top_d.push(0i16);
+            } else {
+                top_d.push(1i16);
+                top_v.push(cat_bytes[r.top as usize].clone());
+            }
+        }
+        // every user ID in one buffer; the column holds zero-copy slices of it
+        let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 10);
+        let mut ends: Vec<u32> = Vec::with_capacity(rows.len());
+        for r in rows {
+            if r.p < FALLBACK {
+                let mut b = [0u8; 10];
+                let n = unpack_id(r.p, &mut b);
+                buf.extend_from_slice(&b[..n]);
+            } else {
+                buf.extend_from_slice(reg[&r.p]);
+            }
+            ends.push(buf.len() as u32);
+        }
+        let buf = bytes::Bytes::from(buf);
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut a = 0usize;
+        for &e in &ends {
+            ids.push(ByteArray::from(buf.slice(a..e as usize)));
+            a = e as usize;
+        }
+        out::write(
+            &ud.join(format!("part-{k}.parquet")),
+            out::USER_DAILY,
+            vec![
+                out::Col::Str(ids),
+                out::Col::I32(rows.iter().map(|r| r.day).collect()),
+                out::Col::I64(rows.iter().map(|r| r.sessions).collect()),
+                out::Col::I64(rows.iter().map(|r| r.events).collect()),
+                out::Col::I64(rows.iter().map(|r| r.revenue).collect()),
+                out::Col::OptStr(top_v, top_d),
+            ],
+        );
+    };
+
+    let sweeps: Vec<Sweep> = par_fin(
         nt,
         NP,
         || Sweep {
@@ -803,62 +900,10 @@ fn main() {
             st.ev = ev;
             st.ck = ck;
         },
+        |st, k| write_part(&st.rows, k),
     );
     std::thread::spawn(move || drop((evs, cks)));
     lap("sweep");
-
-    // ---- outputs
-    let ud = outd.join("user_daily");
-    let cd = outd.join("campaign_daily");
-    std::fs::create_dir_all(&ud).expect("mkdir user_daily");
-    std::fs::create_dir_all(&cd).expect("mkdir campaign_daily");
-    let parts: Vec<&Vec<URow>> = sweeps.iter().map(|s| &s.rows).collect();
-    let cat_bytes: Vec<ByteArray> = cat_names.iter().map(|c| ByteArray::from(c.to_vec())).collect();
-    par(nt, parts.len(), || (), |_, k| {
-        let rows = parts[k];
-        let mut top_v = Vec::new();
-        let mut top_d = Vec::with_capacity(rows.len());
-        for r in rows {
-            if r.top == NO_CAT {
-                top_d.push(0i16);
-            } else {
-                top_d.push(1i16);
-                top_v.push(cat_bytes[r.top as usize].clone());
-            }
-        }
-        // every user ID in one buffer; the column holds zero-copy slices of it
-        let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 10);
-        let mut ends: Vec<u32> = Vec::with_capacity(rows.len());
-        for r in rows {
-            if r.p < FALLBACK {
-                let mut b = [0u8; 10];
-                let n = unpack_id(r.p, &mut b);
-                buf.extend_from_slice(&b[..n]);
-            } else {
-                buf.extend_from_slice(reg[&r.p]);
-            }
-            ends.push(buf.len() as u32);
-        }
-        let buf = bytes::Bytes::from(buf);
-        let mut ids = Vec::with_capacity(rows.len());
-        let mut a = 0usize;
-        for &e in &ends {
-            ids.push(ByteArray::from(buf.slice(a..e as usize)));
-            a = e as usize;
-        }
-        out::write(
-            &ud.join(format!("part-{k}.parquet")),
-            out::USER_DAILY,
-            vec![
-                out::Col::Str(ids),
-                out::Col::I32(rows.iter().map(|r| r.day).collect()),
-                out::Col::I64(rows.iter().map(|r| r.sessions).collect()),
-                out::Col::I64(rows.iter().map(|r| r.events).collect()),
-                out::Col::I64(rows.iter().map(|r| r.revenue).collect()),
-                out::Col::OptStr(top_v, top_d),
-            ],
-        );
-    });
 
     let sum = |f: fn(&Sweep) -> &Vec<i64>| -> Vec<i64> {
         let mut acc = vec![0i64; w];
