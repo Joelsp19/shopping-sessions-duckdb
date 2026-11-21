@@ -1,5 +1,5 @@
 # Team
 
-Name:
-Members:
+Name: Ardere
+Members: Joel Puthankalam
 Engine: DuckDB

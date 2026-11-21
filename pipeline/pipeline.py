@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 import duckdb
 
@@ -23,6 +24,16 @@ from links import parse_links  # noqa: E402
 from outputs import build_outputs  # noqa: E402
 from people import build_people  # noqa: E402
 from sessions import build_sessions  # noqa: E402
+
+
+def read_window(data):
+    """manifest.json window -> (start, end) as epoch ms."""
+    with open(os.path.join(data, "manifest.json")) as f:
+        manifest = json.load(f)
+    return tuple(
+        int(datetime.fromisoformat(manifest[k].replace("Z", "+00:00")).timestamp() * 1000)
+        for k in ("window_start", "window_end")
+    )
 
 
 def main(data, out, scratch, ncpu, mem_gb):
@@ -42,10 +53,7 @@ def main(data, out, scratch, ncpu, mem_gb):
     con.execute("SET enable_progress_bar = false")
     install_macros(con)
 
-    with open(os.path.join(data, "manifest.json")) as f:
-        manifest = json.load(f)
-    ws_ms, we_ms = (con.execute("SELECT iso_ms(?)", [manifest[k]]).fetchone()[0]
-                    for k in ("window_start", "window_end"))
+    ws_ms, we_ms = read_window(data)
 
     parse_links(con, data); lap("links")
     clean_events(con, data, ws_ms, we_ms); lap("events")

@@ -5,3 +5,7 @@ out/
 .git
 .tmp/
 out/
+__pycache__/
+*.pyc
+dev-answer/
+scripts/

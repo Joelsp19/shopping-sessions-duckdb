@@ -15,6 +15,9 @@ from scipy.sparse.csgraph import connected_components
 
 def build_people(con):
     n = con.execute("SELECT count(*) FROM user_ids").fetchone()[0]
+    if n == 0:  # no surviving rows at all
+        con.execute("CREATE OR REPLACE TEMP TABLE pid_map (uid UINTEGER, pid UINTEGER)")
+        return
     e = con.execute("SELECT a, b FROM links").fetchnumpy()
     a = np.asarray(e["a"], dtype=np.int64)
     b = np.asarray(e["b"], dtype=np.int64)

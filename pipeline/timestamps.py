@@ -2,8 +2,8 @@
 Fast timestamp parsing (rules.md "Timestamps").
 
 ts_fast(x) -> epoch ms, or NULL for a bad timestamp. It must agree with the
-exact ts_ms() macro in common.py on every input that could fall in a window;
-.tmp/fuzz_ts.py checks this on all dev timestamps plus ~2M mutated ones.
+exact, slow ts_ms() macro of the reference implementation on every input that
+could fall in a window (fuzz-tested on all dev timestamps plus ~2M mutations).
 
 Approach (measured on 10.7M rows, 8 threads):
   - one RE2 regex validates the shape of all forms             ~0.4 s
