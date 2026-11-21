@@ -137,6 +137,66 @@ fn probe<V>(e: &[(u64, V)], mask: usize, k: u64) -> (usize, bool) {
     }
 }
 
+/// ID code -> person code for linked IDs: groups of four keys and their
+/// values in one cache line, probed with one AVX2 compare; the lookup has no
+/// data-dependent branch (an unlinked ID maps to itself).
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Default)]
+struct PGroup {
+    k: [u64; 4],
+    v: [u64; 4],
+}
+struct PTable {
+    g: Vec<PGroup>,
+    gmask: usize,
+}
+impl PTable {
+    fn new(n: usize) -> Self {
+        let ng = (n / 2).next_power_of_two().max(4);
+        PTable { g: vec![PGroup::default(); ng], gmask: ng - 1 }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.g.as_ptr().add(mix(k) as usize & self.gmask) as *const i8);
+        }
+    }
+    /// Person of ID code u.
+    #[inline(always)]
+    fn get(&self, u: u64) -> u64 {
+        let mut gi = mix(u) as usize & self.gmask;
+        loop {
+            let g = unsafe { self.g.get_unchecked(gi) };
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            let (eq, em) = unsafe {
+                use std::arch::x86_64::*;
+                let v = _mm256_load_si256(g.k.as_ptr() as *const __m256i);
+                let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_set1_epi64x(u as i64)))) as u32;
+                let em = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_setzero_si256()))) as u32;
+                (eq, em)
+            };
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            let (eq, em) = {
+                let mut eq = 0u32;
+                let mut em = 0u32;
+                for j in 0..4 {
+                    eq |= ((g.k[j] == u) as u32) << j;
+                    em |= ((g.k[j] == 0) as u32) << j;
+                }
+                (eq, em)
+            };
+            if eq | em != 0 {
+                let v = g.v[(eq.trailing_zeros() & 3) as usize];
+                let m = ((eq != 0) as u64).wrapping_neg();
+                return (v & m) | (u & !m);
+            }
+            gi = (gi + 1) & self.gmask;
+        }
+    }
+}
+
 // ---------- ID codes; the registry resolves the rare fallback codes ----------
 #[derive(Default)]
 struct Coder<'a> {
@@ -255,8 +315,9 @@ struct Line([u64; 8]);
 /// staged in a 64-byte slot (L1) and written out whole with streaming
 /// stores, so the destination line is never read from memory first.
 /// T's size must divide 64. Call `finish` before reading.
+const SL: usize = 4; // staged lines per bucket
 struct Scatter<T> {
-    stage: Vec<Line>,
+    stage: Vec<[Line; SL]>,
     fill: Vec<u8>,
     out: Vec<Vec<Line>>,
     n: Vec<usize>,
@@ -265,12 +326,12 @@ struct Scatter<T> {
 unsafe impl<T: Send> Send for Scatter<T> {}
 unsafe impl<T: Sync> Sync for Scatter<T> {}
 impl<T: Copy> Scatter<T> {
-    const PER: usize = 64 / std::mem::size_of::<T>();
+    const PER: usize = SL * 64 / std::mem::size_of::<T>();
     fn new(items: usize) -> Self {
         assert!(64 % std::mem::size_of::<T>() == 0);
-        let lines = items / Self::PER + 2;
+        let lines = items * std::mem::size_of::<T>() / 64 + 2 * SL;
         Scatter {
-            stage: vec![Line([0; 8]); NP],
+            stage: vec![[Line([0; 8]); SL]; NP],
             fill: vec![0; NP],
             out: (0..NP).map(|_| Vec::with_capacity(lines)).collect(),
             n: vec![0; NP],
@@ -281,11 +342,11 @@ impl<T: Copy> Scatter<T> {
     fn push(&mut self, b: usize, x: T) {
         unsafe {
             let f = *self.fill.get_unchecked(b) as usize;
-            let st = self.stage.as_mut_ptr().add(b);
+            let st = self.stage.as_mut_ptr().add(b) as *mut Line;
             (st as *mut T).add(f).write(x);
             if f + 1 == Self::PER {
                 let v = self.out.get_unchecked_mut(b);
-                if v.len() == v.capacity() {
+                if v.capacity() - v.len() < SL {
                     v.reserve(v.len().max(64));
                 }
                 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -293,12 +354,13 @@ impl<T: Copy> Scatter<T> {
                     use std::arch::x86_64::*;
                     let src = st as *const __m256i;
                     let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
-                    _mm256_stream_si256(dst, _mm256_load_si256(src));
-                    _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
+                    for k in 0..2 * SL {
+                        _mm256_stream_si256(dst.add(k), _mm256_load_si256(src.add(k)));
+                    }
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-                v.as_mut_ptr().add(v.len()).write(*st);
-                v.set_len(v.len() + 1);
+                std::ptr::copy_nonoverlapping(st, v.as_mut_ptr().add(v.len()), SL);
+                v.set_len(v.len() + SL);
                 *self.fill.get_unchecked_mut(b) = 0;
             } else {
                 *self.fill.get_unchecked_mut(b) = (f + 1) as u8;
@@ -319,9 +381,9 @@ impl<T: Copy> Scatter<T> {
         for b in 0..NP {
             let f = self.fill[b] as usize;
             let v = &mut self.out[b];
-            self.n[b] = v.len() * Self::PER + f;
+            self.n[b] = v.len() * 64 / std::mem::size_of::<T>() + f;
             if f > 0 {
-                v.push(self.stage[b]);
+                v.extend_from_slice(&self.stage[b]);
             }
             self.fill[b] = 0;
         }
@@ -671,12 +733,7 @@ fn main() {
         ev_parts.push(b);
     }
     // linked users map to their person; everyone else names themselves
-    let person_of = |u: u64| {
-        let (i, f) = person.slot(u);
-        let v = unsafe { person.e.get_unchecked(i).1 };
-        let m = (f as u64).wrapping_neg();
-        (v & m) | (u & !m)
-    };
+    let person_of = |u: u64| person.get(u);
     lap("parse");
 
     // ---- one task pool: dedup each event bucket (earliest ingest wins, then
@@ -737,7 +794,7 @@ fn main() {
                 }
                 for (k, c) in best.iter().enumerate() {
                     if let Some(n) = best.get(k + AHEAD) {
-                        prefetch(&person.e, person.mask, n.user);
+                        person.prefetch(n.user);
                     }
                     if c.t != INVALID && c.ing - (ws + c.t as i64) <= DAY_MS {
                         let p = person_of(c.user);
@@ -751,7 +808,7 @@ fn main() {
                 let (bufs, cd, pend, tc) = (&mut st.ck, &mut st.cd, &mut st.pend, &mut st.tc);
                 let flush = |pend: &mut Vec<CkRec>, bufs: &mut Vec<Vec<CkRec>>| {
                     for r in pend.iter() {
-                        prefetch(&person.e, person.mask, r.p);
+                        person.prefetch(r.p);
                     }
                     for r in pend.iter() {
                         let p = person_of(r.p);
@@ -1295,7 +1352,7 @@ impl<T> SharedPtr<T> {
 /// Links -> union-find -> for every linked ID that does not name its person,
 /// ID code -> person code (the byte-wise smallest ID of the person).
 /// Everything but the union-find itself runs on all threads.
-fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (Table<u64>, Reg<'a>) {
+fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
     let t0 = Instant::now();
     let verbose = std::env::var_os("SS_VERBOSE").is_some();
     let lapv = |what: &str| {
@@ -1324,7 +1381,7 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (Table<u64>, Reg<'a>) {
     let n2 = 2 * m;
     lapv("parse");
     if m == 0 {
-        return (Table::new(0), reg);
+        return (PTable::new(0), reg);
     }
     let end_code = |j: usize| if j & 1 == 0 { edges[j >> 1].0 } else { edges[j >> 1].1 };
 
@@ -1493,26 +1550,29 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (Table<u64>, Reg<'a>) {
 
     // 5. person table, filled in parallel: a slot is claimed by a
     // compare-and-swap on its key, then its value is written
-    let person: Table<u64> = Table::new(nu);
-    let (tp, tmask) = (SharedPtr(person.e.as_ptr() as *mut (u64, u64)), person.mask);
+    let person = PTable::new(nu);
+    let (tp, tmask) = (SharedPtr(person.g.as_ptr() as *mut PGroup), person.gmask);
     par(nt, par_n, || (), |_, r| {
         let (lo, hi) = (r * nu / par_n, (r + 1) * nu / par_n);
         for u in lo..hi {
             if u + 16 < hi {
-                prefetch(&person.e, tmask, codes[u + 16]);
+                person.prefetch(codes[u + 16]);
             }
             let (k, p) = (codes[u], person_code(u));
             if p == k {
                 continue;
             }
-            let mut i = mix(k) as usize & tmask;
-            loop {
-                let key = unsafe { &*(tp.ptr().add(i) as *const std::sync::atomic::AtomicU64) };
-                if key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                    unsafe { (*tp.ptr().add(i)).1 = p };
-                    break;
+            let mut gi = mix(k) as usize & tmask;
+            'ins: loop {
+                let g = unsafe { tp.ptr().add(gi) };
+                for j in 0..4 {
+                    let key = unsafe { &*(std::ptr::addr_of_mut!((*g).k[j]) as *const std::sync::atomic::AtomicU64) };
+                    if key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                        unsafe { (*g).v[j] = p };
+                        break 'ins;
+                    }
                 }
-                i = (i + 1) & tmask;
+                gi = (gi + 1) & tmask;
             }
         }
     });
