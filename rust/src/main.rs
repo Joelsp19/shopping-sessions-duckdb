@@ -334,6 +334,11 @@ impl Default for NameLog<'_> {
     }
 }
 impl<'a> NameLog<'a> {
+    /// A log with room for about n long IDs (no regrowth on the hot path).
+    fn with_capacity(n: usize) -> Self {
+        let per = n / LOG_PARTS + 64;
+        NameLog { parts: (0..LOG_PARTS).map(|_| Vec::with_capacity(per)).collect() }
+    }
     #[inline(always)]
     fn code(&mut self, s: &'a [u8]) -> u64 {
         match pack_id(s) {
@@ -1000,7 +1005,10 @@ fn main() {
     };
     let (ev_line, ck_line) = (avg_line(&ev_maps, 76), avg_line(&ck_maps, 44));
     let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 11 / 10 + 64;
-    let per_p = |bytes: usize, line: usize| bytes / line / nt.max(1) / NPP * 11 / 10 + 64;
+    let per_p = |bytes: usize, line: usize| bytes / line / nt.max(1) / NPP * 13 / 10 + 64;
+    // per thread: about 1 in 8 user IDs is long; rows are about 1 per 6 events
+    let log_cap = |bytes: usize, line: usize| bytes / line / nt.max(1) / 6;
+    let rows_cap = ev_bytes / ev_line / nt.max(1) / 6 + 1024;
 
     // ---- people (links -> union-find -> person codes), then events: every
     // ---- core validates copies and buckets them by hash(event_id)
@@ -1028,7 +1036,7 @@ fn main() {
     let ((person, link_reg), copies) = std::thread::scope(|sc| {
     let h = if overlap { Some(sc.spawn(|| ppl(()))) } else { None };
     let copies = {
-        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per, NP), NameLog::default(), TsCache::default()), |(bufs, cd, tc), ci| {
+        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per, NP), NameLog::with_capacity(log_cap(ev_bytes, ev_line)), TsCache::default()), |(bufs, cd, tc), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -1106,7 +1114,7 @@ fn main() {
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per, NPP), ck: Buckets::new(cko_per, NPP), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
+        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per, NPP), ck: Buckets::new(cko_per, NPP), pend: Vec::with_capacity(32), cd: NameLog::with_capacity(log_cap(ck_bytes, ck_line)), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -1293,7 +1301,7 @@ fn main() {
             cnt: vec![0; ncamp],
             pos: vec![0; ncamp],
             active: Vec::new(),
-            rows: Vec::new(),
+            rows: Vec::with_capacity(rows_cap),
             ev: Vec::new(),
             ck: Vec::new(),
             flat_ev: Vec::new(),
