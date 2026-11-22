@@ -494,10 +494,12 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
     fn new(items: usize, nb: usize) -> Self {
         assert!(64 % std::mem::size_of::<T>() == 0);
         let cap = (items * std::mem::size_of::<T>() / 64 + 2 * SL + SL - 1) / SL * SL;
+        let region: Vec<Line> = Vec::with_capacity(cap * nb);
+        huge(&region);
         Scatter {
             stage: vec![[Line([0; 8]); SL]; nb],
             fill: vec![0; nb],
-            region: Vec::with_capacity(cap * nb),
+            region,
             cap,
             used: vec![0; nb],
             own: (0..nb).map(|_| Vec::new()).collect(),
@@ -611,7 +613,9 @@ unsafe impl<T: Sync> Sync for Buckets<T> {}
 impl<T: Copy> Buckets<T> {
     fn new(items: usize, nb: usize) -> Self {
         let cap = items + 16;
-        Buckets { region: Vec::with_capacity(cap * nb), cap, used: vec![0; nb], own: (0..nb).map(|_| Vec::new()).collect() }
+        let region: Vec<T> = Vec::with_capacity(cap * nb);
+        huge(&region);
+        Buckets { region, cap, used: vec![0; nb], own: (0..nb).map(|_| Vec::new()).collect() }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
@@ -692,6 +696,24 @@ fn populate(c: &[u8]) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = c;
+}
+
+/// Transparent huge pages for a big, fresh (untouched) buffer: one fault per
+/// 2 MB instead of one per 4 KB as it is first written.
+fn huge<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        let a = (v.as_ptr() as usize + (2 << 20) - 1) & !((2 << 20) - 1);
+        let b = (v.as_ptr() as usize + v.capacity() * std::mem::size_of::<T>()) & !((2 << 20) - 1);
+        if b > a {
+            unsafe { madvise(a as *mut std::ffi::c_void, b - a, 14) }; // MADV_HUGEPAGE
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
 }
 
 /// Data part of a file (after its header line).
