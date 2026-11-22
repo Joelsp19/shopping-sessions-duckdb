@@ -646,6 +646,18 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
         }
     }
 }
+impl<T, const NT: bool> Scatter<T, NT> {
+    /// The memory holding this scatter's lines.
+    fn ranges(&self) -> Vec<(usize, usize)> {
+        let mut v = vec![(self.region.as_ptr() as usize, self.region.capacity() * 64)];
+        for o in &self.own {
+            if o.capacity() > 0 {
+                v.push((o.as_ptr() as usize, o.capacity() * 64));
+            }
+        }
+        v
+    }
+}
 impl<T, const NT: bool> std::ops::Index<usize> for Scatter<T, NT> {
     type Output = [T];
     #[inline]
@@ -768,6 +780,35 @@ fn huge<T>(v: &Vec<T>) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = v;
+}
+
+/// Drops the page-table entries of address ranges that are no longer read
+/// (or only rarely: a later access just maps the page again), from a
+/// background thread. MADV_DONTNEED needs only the shared memory-map lock, so
+/// the workers' page faults go on; and the exit has far less left to tear
+/// down (a single-threaded cost that is part of the measured run).
+fn release_bg(ranges: Vec<(usize, usize)>) {
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(move || {
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        for (p, n) in ranges {
+            let a = (p + 4095) & !4095;
+            let b = (p + n) & !4095;
+            let mut x = a;
+            while x < b {
+                let e = (x + (64 << 20)).min(b);
+                unsafe { madvise(x as *mut std::ffi::c_void, e - x, 4) }; // MADV_DONTNEED
+                x = e;
+            }
+        }
+    });
+    #[cfg(not(target_os = "linux"))]
+    let _ = ranges;
+}
+fn map_ranges(maps: &[Mmap]) -> Vec<(usize, usize)> {
+    maps.iter().map(|m| (m.as_ptr() as usize, m.len())).collect()
 }
 
 /// Data part of a file (after its header line).
@@ -1075,6 +1116,9 @@ fn main() {
     (pl, copies)
     });
     lap("people+parse");
+    // the event files are read: drop their mappings in the background (the
+    // long user IDs logged from them are mapped again when written out)
+    release_bg(map_ranges(&ev_maps));
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
     let mut logs: Vec<NameLog> = Vec::new();
@@ -1204,7 +1248,10 @@ fn main() {
     }
     let work = run_dedup();
     // freeing ~0.7 GB unmaps every page: let a background thread do it
-    std::thread::spawn(move || drop(ev_parts));
+    // the parsed copies are consumed: give their pages back in the background
+    // without unmapping (munmap would take the exclusive map lock)
+    release_bg(ev_parts.iter().flat_map(|w| w.ranges()).collect());
+    std::mem::forget(ev_parts);
     let mut evs = Vec::with_capacity(work.len());
     let mut cks = Vec::with_capacity(work.len());
     for wk in work {
