@@ -171,6 +171,14 @@ impl PTable {
         PTable { g: vec![PGroup::default(); ng], gmask: ng - 1, bits: (0..1usize << (PBITS - 6)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect() }
     }
     #[inline(always)]
+    fn prefetch_bit(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch::<_MM_HINT_T0>(self.bits.as_ptr().add(pbit(k) >> 6) as *const i8);
+        }
+    }
+    #[inline(always)]
     fn maybe(&self, k: u64) -> bool {
         let b = pbit(k);
         unsafe { self.bits.get_unchecked(b >> 6) }.load(Ordering::Relaxed) >> (b & 63) & 1 != 0
@@ -983,6 +991,9 @@ fn main() {
                     }
                 }
                 for (k, c) in best.iter().enumerate() {
+                    if let Some(n) = best.get(k + 2 * AHEAD) {
+                        person.prefetch_bit(n.user);
+                    }
                     if let Some(n) = best.get(k + AHEAD) {
                         person.prefetch(n.user);
                     }
