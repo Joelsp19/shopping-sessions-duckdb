@@ -20,7 +20,7 @@ pub fn write(path: &Path, schema: &str, cols: Vec<Col>) {
     let schema = Arc::new(parse_message_type(schema).expect("schema"));
     let props = Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
             .build(),
