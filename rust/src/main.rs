@@ -216,15 +216,11 @@ impl<'a> Coder<'a> {
             None => self.slow(s),
         }
     }
-    #[cold]
+    #[inline]
     fn slow(&mut self, s: &'a [u8]) -> u64 {
+        // a 63-bit hash: a collision among ~10^6 long IDs has odds ~10^-7
         let h = FALLBACK | (hash_bytes(s) >> 1);
-        match self.fb.entry(h) {
-            Entry::Vacant(e) => {
-                e.insert(s);
-            }
-            Entry::Occupied(e) => assert!(*e.get() == s, "ID hash collision"),
-        }
+        self.fb.entry(h).or_insert(s);
         h
     }
 }
@@ -265,15 +261,31 @@ fn cid_lt(a: u64, b: u64) -> bool {
     let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
     ptr_bytes(a, &mut x) < ptr_bytes(b, &mut y)
 }
-type Reg<'a> = Map<u64, &'a [u8]>;
-fn merge<'a>(reg: &mut Reg<'a>, c: Coder<'a>) {
-    for (h, s) in c.fb {
-        match reg.entry(h) {
-            Entry::Vacant(e) => {
-                e.insert(s);
+/// Registry of long user IDs: the per-thread maps, kept as they are (merging
+/// them would be serial work; lookups are rare: output rows and orderings).
+#[derive(Default)]
+struct Reg<'a> {
+    maps: Vec<Map<u64, &'a [u8]>>,
+}
+impl<'a> Reg<'a> {
+    fn is_empty(&self) -> bool {
+        self.maps.iter().all(|m| m.is_empty())
+    }
+}
+impl<'a> std::ops::Index<&u64> for Reg<'a> {
+    type Output = &'a [u8];
+    fn index(&self, h: &u64) -> &&'a [u8] {
+        for m in &self.maps {
+            if let Some(s) = m.get(h) {
+                return s;
             }
-            Entry::Occupied(e) => assert!(*e.get() == s, "ID hash collision"),
         }
+        panic!("unregistered ID code")
+    }
+}
+fn merge<'a>(reg: &mut Reg<'a>, c: Coder<'a>) {
+    if !c.fb.is_empty() {
+        reg.maps.push(c.fb);
     }
 }
 /// Bytes of a user ID code.
@@ -1423,7 +1435,7 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
             }
         });
     });
-    let mut reg: Reg = Map::default();
+    let mut reg: Reg = Reg::default();
     let mut edges: Vec<(u64, u64)> = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
     for (e, cd) in parts {
         merge(&mut reg, cd);
@@ -1588,15 +1600,61 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
     });
     unsafe { root.set_len(nu) };
     // Packed codes compare as bytes; fallback IDs need a byte-wise pass.
+    // In parallel: each component's minimum 8-byte prefix (big-endian, zero
+    // padded, so it orders like the bytes), then among the IDs holding it
+    // the byte-wise smallest (compare-and-swap on its index).
     let mut best_root: Vec<u64> = Vec::new();
     if !reg.is_empty() {
-        best_root = codes.clone();
-        for u in 0..nu {
-            let r = root[u] as usize;
-            if id_lt(codes[u], best_root[r], &reg) {
-                best_root[r] = codes[u];
+        use std::sync::atomic::AtomicU64;
+        let mut k8: Vec<u64> = Vec::with_capacity(nu);
+        let kp = SharedPtr(k8.as_mut_ptr());
+        par(nt, par_n, || (), |_, r| {
+            for u in r * nu / par_n..(r + 1) * nu / par_n {
+                let mut buf = [0u8; 10];
+                let b = id_bytes(codes[u], &reg, &mut buf);
+                let mut k = [0u8; 8];
+                let n = b.len().min(8);
+                k[..n].copy_from_slice(&b[..n]);
+                unsafe { kp.write(u, u64::from_be_bytes(k)) };
             }
-        }
+        });
+        unsafe { k8.set_len(nu) };
+        let best8: Vec<AtomicU64> = (0..nu).map(|_| AtomicU64::new(u64::MAX)).collect();
+        par(nt, par_n, || (), |_, r| {
+            for u in r * nu / par_n..(r + 1) * nu / par_n {
+                best8[root[u] as usize].fetch_min(k8[u], Ordering::Relaxed);
+            }
+        });
+        let bidx: Vec<AtomicU32> = (0..nu).map(|_| AtomicU32::new(u32::MAX)).collect();
+        par(nt, par_n, || (), |_, r| {
+            for u in r * nu / par_n..(r + 1) * nu / par_n {
+                let rt = root[u] as usize;
+                if k8[u] != best8[rt].load(Ordering::Relaxed) {
+                    continue;
+                }
+                let slot = &bidx[rt];
+                let mut cur = slot.load(Ordering::Relaxed);
+                loop {
+                    if cur != u32::MAX && !id_lt(codes[u], codes[cur as usize], &reg) {
+                        break;
+                    }
+                    match slot.compare_exchange(cur, u as u32, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => break,
+                        Err(x) => cur = x,
+                    }
+                }
+            }
+        });
+        let mut br: Vec<u64> = Vec::with_capacity(nu);
+        let bp = SharedPtr(br.as_mut_ptr());
+        par(nt, par_n, || (), |_, r| {
+            for u in r * nu / par_n..(r + 1) * nu / par_n {
+                let b = bidx[u].load(Ordering::Relaxed);
+                unsafe { bp.write(u, if b == u32::MAX { codes[u] } else { codes[b as usize] }) };
+            }
+        });
+        unsafe { br.set_len(nu) };
+        best_root = br;
     }
     let person_code = |u: usize| if best_root.is_empty() { codes[root[u] as usize] } else { best_root[root[u] as usize] };
 
