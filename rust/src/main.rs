@@ -1445,7 +1445,27 @@ fn group_sort<T: Copy>(
         let len = e - a;
         if len > 1 {
             let g = &mut out[a..e];
-            if len <= 24 {
+            let p0 = p(&g[0]);
+            let single = g.iter().all(|x| p(x) == p0);
+            if single {
+                // one person: order by time alone (u32 compares)
+                if len <= 32 {
+                    for i in 1..len {
+                        let v = g[i];
+                        let kv = t(&v);
+                        let mut j = i;
+                        while j > 0 && t(&g[j - 1]) > kv {
+                            g[j] = g[j - 1];
+                            j -= 1;
+                        }
+                        g[j] = v;
+                    }
+                } else if len >= 256 {
+                    radix_t(g, &mut sc.tmp, &t);
+                } else {
+                    g.sort_unstable_by_key(|x| t(x));
+                }
+            } else if len <= 24 {
                 for i in 1..len {
                     let v = g[i];
                     let kv = key(&v);
@@ -1456,8 +1476,6 @@ fn group_sort<T: Copy>(
                     }
                     g[j] = v;
                 }
-            } else if len >= 256 && g.iter().all(|x| p(x) == p(&g[0])) {
-                radix_t(g, &mut sc.tmp, &t);
             } else {
                 g.sort_unstable_by_key(|x| key(x));
             }
