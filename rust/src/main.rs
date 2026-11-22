@@ -728,6 +728,9 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    // two software threads per vCPU: a thread stalled on memory leaves its
+    // core to the other
+    let nt = nt * 2;
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = ts_ms(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
