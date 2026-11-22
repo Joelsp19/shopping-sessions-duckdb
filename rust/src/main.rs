@@ -21,6 +21,60 @@
 mod out;
 mod parse;
 
+/// The system allocator, plus a transparent-huge-page hint on every big
+/// allocation: buffers are faulted in 2 MB at a time instead of 4 KB (page
+/// faults are a large share of the run on the scorer).
+struct HugeAlloc;
+const HUGE_MIN: usize = 4 << 20;
+#[inline]
+fn advise_huge(p: *mut u8, n: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        let a = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
+        let b = (p as usize + n) & !((2 << 20) - 1);
+        if b > a {
+            unsafe { madvise(a as *mut std::ffi::c_void, b - a, 14) }; // MADV_HUGEPAGE
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (p, n);
+}
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = std::alloc::System.alloc(l);
+        if l.size() >= HUGE_MIN && !p.is_null() {
+            advise_huge(p, l.size());
+        }
+        p
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = std::alloc::System.alloc_zeroed(l);
+        if l.size() >= HUGE_MIN && !p.is_null() {
+            advise_huge(p, l.size());
+        }
+        p
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        std::alloc::System.dealloc(p, l)
+    }
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        let q = std::alloc::System.realloc(p, l, n);
+        if n >= HUGE_MIN && !q.is_null() {
+            advise_huge(q, n);
+        }
+        q
+    }
+}
+#[global_allocator]
+static GLOBAL: HugeAlloc = HugeAlloc;
+
 use memmap2::Mmap;
 use parquet::data_type::ByteArray;
 use parse::{fields, for_each_line, for_each_record, hash_bytes, mix, pack_id, price, ts_ms, unpack_id, TsCache, DAY_MS, FALLBACK};
@@ -933,15 +987,27 @@ fn main() {
     // slack); a reservation is only address space until it is written.
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
-    let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 6 / 5 + 64;
-    let per_p = |bytes: usize, line: usize| bytes / line / nt.max(1) / NPP * 6 / 5 + 64;
+    // bytes per line, measured on a sample (lines get longer with long IDs);
+    // sizing buffers close to their use matters: huge pages zero what they span
+    let avg_line = |maps: &[Mmap], dflt: usize| -> usize {
+        let m = match maps.iter().max_by_key(|m| m.len()) {
+            Some(m) if m.len() > 4096 => m,
+            _ => return dflt,
+        };
+        let s = &m[..m.len().min(2 << 20)];
+        let n = memchr::memchr_iter(10u8, s).count();
+        if n < 16 { dflt } else { (s.len() / n).max(8) }
+    };
+    let (ev_line, ck_line) = (avg_line(&ev_maps, 76), avg_line(&ck_maps, 44));
+    let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 11 / 10 + 64;
+    let per_p = |bytes: usize, line: usize| bytes / line / nt.max(1) / NPP * 11 / 10 + 64;
 
     // ---- people (links -> union-find -> person codes), then events: every
     // ---- core validates copies and buckets them by hash(event_id)
     let tc = Instant::now();
     let ln_chunks = chunks(&ln_maps);
     let ev_chunks = chunks(&ev_maps);
-    let ev_per = per(ev_bytes, 76);
+    let ev_per = per(ev_bytes, ev_line);
     if std::env::var_os("SS_VERBOSE").is_some() {
         eprintln!("  (chunks {:.3}s)", tc.elapsed().as_secs_f64());
     }
@@ -1026,7 +1092,7 @@ fn main() {
     // ---- and scatter by hash(person). Tables and buffers are reused per thread.
     let ck_chunks = chunks(&ck_maps);
     let cbase = ws - WEEK;
-    let (evo_per, cko_per) = (per_p(ev_bytes, 76), per_p(ck_bytes, 44));
+    let (evo_per, cko_per) = (per_p(ev_bytes, ev_line), per_p(ck_bytes, ck_line));
     struct Work<'a> {
         tab: Vec<(u64, (u32, u32))>, // (eid, (index in best, generation))
         gen: u32,
