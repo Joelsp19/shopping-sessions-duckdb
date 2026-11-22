@@ -203,10 +203,16 @@ impl PTable {
 // their bytes in a registry (persons are named and written out by them), event
 // IDs are only ever compared for equality and keep nothing, and click IDs (only
 // ever ordered, on a credit tie) carry a pointer to their bytes instead.
-#[derive(Default)]
 struct Coder<'a> {
     fb: Map<u64, &'a [u8]>,
+    seen: Vec<u64>, // direct-mapped: codes already in fb (a miss just re-checks fb)
 }
+impl Default for Coder<'_> {
+    fn default() -> Self {
+        Coder { fb: Map::default(), seen: Vec::new() }
+    }
+}
+const SEEN: usize = 1 << 17;
 impl<'a> Coder<'a> {
     /// A user ID (registered).
     #[inline]
@@ -220,7 +226,15 @@ impl<'a> Coder<'a> {
     fn slow(&mut self, s: &'a [u8]) -> u64 {
         // a 63-bit hash: a collision among ~10^6 long IDs has odds ~10^-7
         let h = FALLBACK | (hash_bytes(s) >> 1);
-        self.fb.entry(h).or_insert(s);
+        if self.seen.is_empty() {
+            self.seen = vec![0; SEEN];
+        }
+        let i = (h as usize) & (SEEN - 1);
+        let t = unsafe { self.seen.get_unchecked_mut(i) };
+        if *t != h {
+            *t = h;
+            self.fb.entry(h).or_insert(s);
+        }
         h
     }
 }
@@ -375,17 +389,17 @@ struct Line([u64; 8]);
 /// stores, so the destination line is never read from memory first.
 /// T's size must divide 64. Call `finish` before reading.
 const SL: usize = 4; // staged lines per bucket
-const NTSTORE: bool = true;
-struct Scatter<T> {
+const DEDUP_NT: bool = true;
+struct Scatter<T, const NT: bool = true> {
     stage: Vec<[Line; SL]>,
     fill: Vec<u8>,
     out: Vec<Vec<Line>>,
     n: Vec<usize>,
     _t: std::marker::PhantomData<T>,
 }
-unsafe impl<T: Send> Send for Scatter<T> {}
-unsafe impl<T: Sync> Sync for Scatter<T> {}
-impl<T: Copy> Scatter<T> {
+unsafe impl<T: Send, const NT: bool> Send for Scatter<T, NT> {}
+unsafe impl<T: Sync, const NT: bool> Sync for Scatter<T, NT> {}
+impl<T: Copy, const NT: bool> Scatter<T, NT> {
     const PER: usize = SL * 64 / std::mem::size_of::<T>();
     fn new(items: usize) -> Self {
         assert!(64 % std::mem::size_of::<T>() == 0);
@@ -415,7 +429,7 @@ impl<T: Copy> Scatter<T> {
                     let src = st as *const __m256i;
                     let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
                     for k in 0..2 * SL {
-                        if NTSTORE {
+                        if NT {
                             _mm256_stream_si256(dst.add(k), _mm256_load_si256(src.add(k)));
                         } else {
                             _mm256_store_si256(dst.add(k), _mm256_load_si256(src.add(k)));
@@ -453,7 +467,7 @@ impl<T: Copy> Scatter<T> {
         }
     }
 }
-impl<T> std::ops::Index<usize> for Scatter<T> {
+impl<T, const NT: bool> std::ops::Index<usize> for Scatter<T, NT> {
     type Output = [T];
     #[inline]
     fn index(&self, b: usize) -> &[T] {
@@ -809,7 +823,7 @@ fn main() {
     struct Work<'a> {
         tab: Vec<(u64, u32)>,
         best: Vec<ECopy>,
-        ev: Scatter<EvRec>,
+        ev: Scatter<EvRec, DEDUP_NT>,
         ck: Vec<Vec<CkRec>>,
         pend: Vec<CkRec>,
         cd: Coder<'a>,
@@ -1660,7 +1674,14 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
 
     // 5. person table, filled in parallel: a slot is claimed by a
     // compare-and-swap on its key, then its value is written
-    let person = PTable::new(nu);
+    let entries: usize = par(nt, par_n, || 0usize, |c, r| {
+        for u in r * nu / par_n..(r + 1) * nu / par_n {
+            *c += (person_code(u) != codes[u]) as usize;
+        }
+    })
+    .into_iter()
+    .sum();
+    let person = PTable::new(entries);
     let (tp, tmask) = (SharedPtr(person.g.as_ptr() as *mut PGroup), person.gmask);
     par(nt, par_n, || (), |_, r| {
         let (lo, hi) = (r * nu / par_n, (r + 1) * nu / par_n);
@@ -1686,6 +1707,10 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
             }
         }
     });
+    if verbose {
+        let filled: usize = person.g.iter().map(|g| g.k.iter().filter(|&&k| k != 0).count()).sum();
+        eprintln!("  (people: nu {nu}, links {m}, table entries {filled}, groups {} = {} MB)", person.g.len(), person.g.len() * 64 >> 20);
+    }
     lapv("table");
     (person, reg)
 }
