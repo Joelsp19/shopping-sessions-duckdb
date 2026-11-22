@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const NPB: u32 = 8; // log2 of the bucket count
+const NPB: u32 = 9; // log2 of the bucket count
 const NP: usize = 1 << NPB;
 /// Profiling probes: how many times to run (parse, dedup+clicks, sweep).
 /// Always (1, 1, 1) in a real build.
