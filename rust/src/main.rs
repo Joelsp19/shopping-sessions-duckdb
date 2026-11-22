@@ -476,7 +476,14 @@ const DEDUP_NT: bool = true;
 struct Scatter<T, const NT: bool = true> {
     stage: Vec<[Line; SL]>,
     fill: Vec<u8>,
-    out: Vec<Vec<Line>>,
+    // every bucket's lines live in one per-thread region (one allocation,
+    // not one per bucket: each heap growth is an mprotect, which takes the
+    // process memory lock that all other threads' page faults wait on);
+    // a bucket that outgrows its slot moves to a vector of its own
+    region: Vec<Line>,
+    cap: usize,
+    used: Vec<u32>,
+    own: Vec<Vec<Line>>,
     n: Vec<usize>,
     _t: std::marker::PhantomData<T>,
 }
@@ -486,14 +493,48 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
     const PER: usize = SL * 64 / std::mem::size_of::<T>();
     fn new(items: usize, nb: usize) -> Self {
         assert!(64 % std::mem::size_of::<T>() == 0);
-        let lines = items * std::mem::size_of::<T>() / 64 + 2 * SL;
+        let cap = (items * std::mem::size_of::<T>() / 64 + 2 * SL + SL - 1) / SL * SL;
         Scatter {
             stage: vec![[Line([0; 8]); SL]; nb],
             fill: vec![0; nb],
-            out: (0..nb).map(|_| Vec::with_capacity(lines)).collect(),
+            region: Vec::with_capacity(cap * nb),
+            cap,
+            used: vec![0; nb],
+            own: (0..nb).map(|_| Vec::new()).collect(),
             n: vec![0; nb],
             _t: std::marker::PhantomData,
         }
+    }
+    /// Where bucket b's next SL lines go (moving the bucket out of the
+    /// region when its slot is full).
+    #[inline(always)]
+    fn slot(&mut self, b: usize) -> *mut Line {
+        unsafe {
+            let u = *self.used.get_unchecked(b) as usize;
+            if self.own.get_unchecked(b).capacity() == 0 {
+                if u + SL <= self.cap {
+                    return self.region.as_mut_ptr().add(b * self.cap + u);
+                }
+                self.relocate(b);
+            }
+            let v = self.own.get_unchecked_mut(b);
+            v.set_len(u); // lines 0..u are written
+            if v.capacity() - u < SL {
+                v.reserve(u.max(64));
+            }
+            v.as_mut_ptr().add(u)
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn relocate(&mut self, b: usize) {
+        let u = self.used[b] as usize;
+        let mut v: Vec<Line> = Vec::with_capacity((2 * self.cap).max(u + 64));
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.region.as_ptr().add(b * self.cap), v.as_mut_ptr(), u);
+            v.set_len(u);
+        }
+        self.own[b] = v;
     }
     #[inline(always)]
     fn push(&mut self, b: usize, x: T) {
@@ -502,15 +543,12 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
             let st = self.stage.as_mut_ptr().add(b) as *mut Line;
             (st as *mut T).add(f).write(x);
             if f + 1 == Self::PER {
-                let v = self.out.get_unchecked_mut(b);
-                if v.capacity() - v.len() < SL {
-                    v.reserve(v.len().max(64));
-                }
+                let dst = self.slot(b);
                 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
                 {
                     use std::arch::x86_64::*;
                     let src = st as *const __m256i;
-                    let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
+                    let dst = dst as *mut __m256i;
                     for k in 0..2 * SL {
                         if NT {
                             _mm256_stream_si256(dst.add(k), _mm256_load_si256(src.add(k)));
@@ -520,8 +558,8 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
                     }
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-                std::ptr::copy_nonoverlapping(st, v.as_mut_ptr().add(v.len()), SL);
-                v.set_len(v.len() + SL);
+                std::ptr::copy_nonoverlapping(st, dst, SL);
+                *self.used.get_unchecked_mut(b) += SL as u32;
                 *self.fill.get_unchecked_mut(b) = 0;
             } else {
                 *self.fill.get_unchecked_mut(b) = (f + 1) as u8;
@@ -541,10 +579,12 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
         self.fence();
         for b in 0..self.fill.len() {
             let f = self.fill[b] as usize;
-            let v = &mut self.out[b];
-            self.n[b] = v.len() * 64 / std::mem::size_of::<T>() + f;
+            let u = self.used[b] as usize;
+            self.n[b] = u * 64 / std::mem::size_of::<T>() + f;
             if f > 0 {
-                v.extend_from_slice(&self.stage[b]);
+                let dst = self.slot(b);
+                unsafe { std::ptr::copy_nonoverlapping(self.stage[b].as_ptr(), dst, SL) };
+                self.used[b] += SL as u32;
             }
             self.fill[b] = 0;
         }
@@ -554,7 +594,52 @@ impl<T, const NT: bool> std::ops::Index<usize> for Scatter<T, NT> {
     type Output = [T];
     #[inline]
     fn index(&self, b: usize) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.out[b].as_ptr() as *const T, self.n[b]) }
+        let p = if self.own[b].capacity() == 0 { unsafe { self.region.as_ptr().add(b * self.cap) } } else { self.own[b].as_ptr() };
+        unsafe { std::slice::from_raw_parts(p as *const T, self.n[b]) }
+    }
+}
+
+/// Per-bucket vectors carved from one region (see Scatter), plain pushes.
+struct Buckets<T> {
+    region: Vec<T>,
+    cap: usize,
+    used: Vec<u32>,
+    own: Vec<Vec<T>>,
+}
+unsafe impl<T: Send> Send for Buckets<T> {}
+unsafe impl<T: Sync> Sync for Buckets<T> {}
+impl<T: Copy> Buckets<T> {
+    fn new(items: usize, nb: usize) -> Self {
+        let cap = items + 16;
+        Buckets { region: Vec::with_capacity(cap * nb), cap, used: vec![0; nb], own: (0..nb).map(|_| Vec::new()).collect() }
+    }
+    #[inline(always)]
+    fn push(&mut self, b: usize, x: T) {
+        unsafe {
+            let u = *self.used.get_unchecked(b) as usize;
+            if u < self.cap && self.own.get_unchecked(b).capacity() == 0 {
+                self.region.as_mut_ptr().add(b * self.cap + u).write(x);
+            } else {
+                if self.own[b].capacity() == 0 {
+                    let mut v = Vec::with_capacity(2 * self.cap);
+                    v.extend_from_slice(std::slice::from_raw_parts(self.region.as_ptr().add(b * self.cap), u));
+                    self.own[b] = v;
+                }
+                self.own[b].push(x);
+            }
+            *self.used.get_unchecked_mut(b) += 1;
+        }
+    }
+}
+impl<T> std::ops::Index<usize> for Buckets<T> {
+    type Output = [T];
+    #[inline]
+    fn index(&self, b: usize) -> &[T] {
+        if self.own[b].capacity() == 0 {
+            unsafe { std::slice::from_raw_parts(self.region.as_ptr().add(b * self.cap), self.used[b] as usize) }
+        } else {
+            &self.own[b]
+        }
     }
 }
 
@@ -925,7 +1010,7 @@ fn main() {
         gen: u32,
         best: Vec<ECopy>,
         ev: Scatter<EvRec, DEDUP_NT>,
-        ck: Vec<Vec<CkRec>>,
+        ck: Buckets<CkRec>,
         pend: Vec<CkRec>,
         cd: NameLog<'a>,
         tc: TsCache,
@@ -933,7 +1018,7 @@ fn main() {
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per, NPP), ck: reserved(cko_per, NPP), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
+        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per, NPP), ck: Buckets::new(cko_per, NPP), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -996,13 +1081,13 @@ fn main() {
                 // valid clicks are batched with p = user code, so the person
                 // lookups can be prefetched before they are resolved
                 let (bufs, cd, pend, tc) = (&mut st.ck, &mut st.cd, &mut st.pend, &mut st.tc);
-                let flush = |pend: &mut Vec<CkRec>, bufs: &mut Vec<Vec<CkRec>>| {
+                let flush = |pend: &mut Vec<CkRec>, bufs: &mut Buckets<CkRec>| {
                     for r in pend.iter() {
                         person.prefetch(r.p);
                     }
                     for r in pend.iter() {
                         let p = person_of(r.p);
-                        bufs[pbucket(mix(p))].push(CkRec { p, ..*r });
+                        bufs.push(pbucket(mix(p)), CkRec { p, ..*r });
                     }
                     pend.clear();
                 };
