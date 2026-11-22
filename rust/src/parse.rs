@@ -115,13 +115,129 @@ pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
 /// Every well-formed line of a chunk as exactly N unquoted fields: the same
 /// results as `fields` on each '\n'-separated line (malformed lines skipped).
 ///
+/// Two stages per batch of up to 128 blocks, with no dependency chain from
+/// one field to the next: (1) the ',' / '\n' positions of every block are
+/// listed and quotes counted per block; (2) a line is N consecutive listed
+/// separators (N-1 commas, then '\n'). A field is quoted when it starts and
+/// ends with '"' (length >= 2); the line is well formed iff its quote count is
+/// exactly 2 per quoted field (any other quote makes `fields` reject it).
+#[inline]
+pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    const NB: usize = 128;
+    const W: usize = NB * 64;
+    let len = chunk.len();
+    let mut pos = [0u32; W + 64];
+    let mut qm = [0u64; NB + 1];
+    let mut qb = [0u32; NB + 1];
+    let mut s = 0usize;
+    while s + 64 <= len {
+        let nb = ((len - s) / 64).min(NB);
+        let region = nb * 64;
+        let bytes = &chunk[s..s + region];
+        // stage 1
+        let mut np = 0usize;
+        let mut qacc = 0u32;
+        for i in 0..nb {
+            let blk: &[u8; 64] = bytes[i * 64..i * 64 + 64].try_into().unwrap();
+            let (ms, _, mq) = masks(blk);
+            qm[i] = mq;
+            qb[i] = qacc;
+            qacc += mq.count_ones();
+            let off = (i * 64) as u32;
+            let cnt = ms.count_ones() as usize;
+            let mut m = ms;
+            for j in 0..8 {
+                unsafe { *pos.get_unchecked_mut(np + j) = off + m.trailing_zeros() };
+                m &= m.wrapping_sub(1);
+            }
+            if cnt > 8 {
+                let mut j = np + 8;
+                while m != 0 {
+                    unsafe { *pos.get_unchecked_mut(j) = off + m.trailing_zeros() };
+                    m &= m - 1;
+                    j += 1;
+                }
+            }
+            np += cnt;
+        }
+        qm[nb] = 0;
+        qb[nb] = qacc;
+        let qcount = |x: usize| -> u32 {
+            let i = x >> 6;
+            unsafe { *qb.get_unchecked(i) + (*qm.get_unchecked(i) & ((1u64 << (x & 63)) - 1)).count_ones() }
+        };
+        // stage 2
+        let at = |i: usize| unsafe { *bytes.get_unchecked(i) };
+        let mut k = 0usize;
+        let mut cur = 0usize;
+        while k + N <= np {
+            let mut e = [0usize; N];
+            for j in 0..N {
+                e[j] = unsafe { *pos.get_unchecked(k + j) } as usize;
+            }
+            let mut ok = at(e[N - 1]) == b'\n';
+            for j in 0..N - 1 {
+                ok &= at(e[j]) == b',';
+            }
+            if ok {
+                let mut out: [&'a [u8]; N] = [&chunk[..0]; N];
+                let mut a = cur;
+                let mut expect = 0u32;
+                for j in 0..N {
+                    let b = e[j];
+                    let q = ((b >= a + 2) & (at(a) == b'"') & (at(b.wrapping_sub(1).min(region - 1)) == b'"')) as usize;
+                    out[j] = unsafe { chunk.get_unchecked(s + a + q..s + b - q) };
+                    expect += 2 * q as u32;
+                    a = b + 1;
+                }
+                if qcount(e[N - 1]) - qcount(cur) == expect {
+                    f(out);
+                }
+                cur = e[N - 1] + 1;
+                k += N;
+            } else {
+                // wrong field count: skip to the line's newline
+                let mut j = k;
+                while j < np && at(pos[j] as usize) != b'\n' {
+                    j += 1;
+                }
+                if j >= np {
+                    break;
+                }
+                cur = pos[j] as usize + 1;
+                k = j + 1;
+            }
+        }
+        if cur == 0 {
+            // no whole line in the batch: one (long) line the slow way
+            let end = memchr(b'\n', &chunk[s..]).map_or(len, |i| s + i);
+            if let Some(r) = fields::<N>(&chunk[s..end]) {
+                f(r);
+            }
+            s = end + 1;
+            continue;
+        }
+        s += cur;
+    }
+    if s < len {
+        for_each_line(&chunk[s..], |l| {
+            if let Some(r) = fields::<N>(l) {
+                f(r);
+            }
+        });
+    }
+}
+
+/// Every well-formed line of a chunk as exactly N unquoted fields: the same
+/// results as `fields` on each '\n'-separated line (malformed lines skipped).
+///
 /// Field at a time: 32 bytes are loaded at the field's start and the first
 /// ',', '\n' or '"' found with one compare. A plain field must end at its
 /// separator; a field opening with '"' must close at the first special byte
 /// with '"' and be followed by its separator. Any line that does not fit (a
 /// field over 31 bytes, quotes inside, wrong field count) goes to `fields`.
 #[inline]
-pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+pub fn for_each_record_f<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         use std::arch::x86_64::*;

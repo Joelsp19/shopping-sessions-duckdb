@@ -13,13 +13,18 @@ fn main() {
     }
     let n = buf.iter().filter(|&&b| b == b'\n').count();
     let mut acc = 0u64;
+    let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
     for ch in buf.chunks(4 << 20) {
         match mode.as_str() {
-            "split" => for_each_record::<7>(ch, |f| acc += f[6].len() as u64),
+            "split" => for_each_record_f::<7>(ch, |f| acc += f[6].len() as u64),
             "v3" => for_each_record_v3::<7>(ch, |f| acc += f[6].len() as u64),
             "ids" => for_each_record::<7>(ch, |f| acc ^= pack_id(f[0]).unwrap_or(1) ^ pack_id(f[1]).unwrap_or(3)),
             "ts" => for_each_record::<7>(ch, |f| acc ^= (ts_ms(f[2]).unwrap_or(1) ^ ts_ms(f[3]).unwrap_or(3)) as u64),
-            "splitall" => for_each_record::<7>(ch, |f| acc += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>()),
+            "splitall" => for_each_record_f::<7>(ch, |f| acc += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>()),
+            "newall" => for_each_record::<7>(ch, |f| acc += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>()),
+            "v3all" => for_each_record_v3::<7>(ch, |f| acc += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>()),
             "tsc" => {
                 let mut c = TsCache::default();
                 for_each_record::<7>(ch, |f| acc ^= (c.ts(f[2]).unwrap_or(1) ^ c.ts(f[3]).unwrap_or(3)) as u64)
@@ -32,5 +37,7 @@ fn main() {
             _ => acc += ch.len() as u64,
         }
     }
-    println!("lines {n} acc {acc}");
+    }
+    let el = t0.elapsed().as_secs_f64();
+    println!("lines {n} acc {acc} {:.1} ns/line", el * 1e9 / (n * reps) as f64);
 }
