@@ -149,23 +149,45 @@ struct PGroup {
 struct PTable {
     g: Vec<PGroup>,
     gmask: usize,
+    // one bit per hash of every key: a clear bit means "not in the table", so
+    // most unlinked IDs never touch the (DRAM-sized) groups
+    bits: Vec<std::sync::atomic::AtomicU64>,
+}
+const PBITS: u32 = 23;
+#[inline(always)]
+fn pbit(k: u64) -> usize {
+    (mix(k) >> (64 - PBITS)) as usize
 }
 impl PTable {
     fn new(n: usize) -> Self {
         let ng = (n / 2).next_power_of_two().max(4);
-        PTable { g: vec![PGroup::default(); ng], gmask: ng - 1 }
+        PTable { g: vec![PGroup::default(); ng], gmask: ng - 1, bits: (0..1usize << (PBITS - 6)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect() }
+    }
+    #[inline(always)]
+    fn maybe(&self, k: u64) -> bool {
+        let b = pbit(k);
+        unsafe { self.bits.get_unchecked(b >> 6) }.load(Ordering::Relaxed) >> (b & 63) & 1 != 0
+    }
+    fn mark(&self, k: u64) {
+        let b = pbit(k);
+        self.bits[b >> 6].fetch_or(1 << (b & 63), Ordering::Relaxed);
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch::<_MM_HINT_T0>(self.g.as_ptr().add(mix(k) as usize & self.gmask) as *const i8);
+            if self.maybe(k) {
+                _mm_prefetch::<_MM_HINT_T0>(self.g.as_ptr().add(mix(k) as usize & self.gmask) as *const i8);
+            }
         }
     }
     /// Person of ID code u.
     #[inline(always)]
     fn get(&self, u: u64) -> u64 {
+        if !self.maybe(u) {
+            return u;
+        }
         let mut gi = mix(u) as usize & self.gmask;
         loop {
             let g = unsafe { self.g.get_unchecked(gi) };
@@ -1757,6 +1779,7 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
                     let key = unsafe { &*(std::ptr::addr_of_mut!((*g).k[j]) as *const std::sync::atomic::AtomicU64) };
                     if key.compare_exchange(0, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
                         unsafe { (*g).v[j] = p };
+                        person.mark(k);
                         break 'ins;
                     }
                 }
