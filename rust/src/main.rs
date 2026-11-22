@@ -168,7 +168,10 @@ fn pbit(k: u64) -> usize {
 impl PTable {
     fn new(n: usize) -> Self {
         let ng = (n / 2).next_power_of_two().max(4);
-        PTable { g: vec![PGroup::default(); ng], gmask: ng - 1, bits: (0..1usize << (PBITS - 6)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect() }
+        let mut g = Vec::with_capacity(ng);
+        huge(&g);
+        g.resize(ng, PGroup::default());
+        PTable { g, gmask: ng - 1, bits: (0..1usize << (PBITS - 6)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect() }
     }
     #[inline(always)]
     fn maybe(&self, k: u64) -> bool {
@@ -609,6 +612,24 @@ fn populate(c: &[u8]) {
     let _ = c;
 }
 
+/// Asks for transparent huge pages on a fresh (untouched) buffer: randomly
+/// probed tables then need a handful of TLB entries instead of thousands.
+fn huge<T>(v: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        let a = (v.as_ptr() as usize + (2 << 20) - 1) & !((2 << 20) - 1);
+        let b = (v.as_ptr() as usize + v.capacity() * std::mem::size_of::<T>()) & !((2 << 20) - 1);
+        if b > a {
+            unsafe { madvise(a as *mut std::ffi::c_void, b - a, 14) }; // MADV_HUGEPAGE
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = v;
+}
+
 /// Data part of a file (after its header line).
 fn body(d: &[u8]) -> &[u8] {
     match memchr::memchr(b'\n', d) {
@@ -943,7 +964,10 @@ fn main() {
                 let total: usize = ev_parts.iter().map(|w| w[dp].len()).sum();
                 let cap = (total * 2).next_power_of_two().max(16);
                 if st.tab.len() < cap {
-                    st.tab.resize(cap, (0, (0, 0)));
+                    let mut t = Vec::with_capacity(cap);
+                    huge(&t);
+                    t.resize(cap, (0, (0, 0)));
+                    st.tab = t;
                 }
                 // a slot is live only if it carries this task's generation,
                 // so the table is never cleared
