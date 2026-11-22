@@ -198,11 +198,17 @@ impl PTable {
 }
 
 // ---------- ID codes; the registry resolves the rare fallback codes ----------
+// Short IDs pack into exact order-preserving codes. Longer ones (1 in 8 user,
+// event and click IDs carry a 32-hex suffix) get FALLBACK | hash: user IDs keep
+// their bytes in a registry (persons are named and written out by them), event
+// IDs are only ever compared for equality and keep nothing, and click IDs (only
+// ever ordered, on a credit tie) carry a pointer to their bytes instead.
 #[derive(Default)]
 struct Coder<'a> {
-    fb: HashMap<u64, &'a [u8]>,
+    fb: Map<u64, &'a [u8]>,
 }
 impl<'a> Coder<'a> {
+    /// A user ID (registered).
     #[inline]
     fn code(&mut self, s: &'a [u8]) -> u64 {
         match pack_id(s) {
@@ -222,7 +228,44 @@ impl<'a> Coder<'a> {
         h
     }
 }
-type Reg<'a> = HashMap<u64, &'a [u8]>;
+/// An ID compared only for equality (event IDs): no registry.
+#[inline]
+fn eq_code(s: &[u8]) -> u64 {
+    match pack_id(s) {
+        Some(v) => v,
+        None => FALLBACK | (hash_bytes(s) >> 1),
+    }
+}
+/// An ID compared only for order (click IDs): long ones point at their bytes,
+/// which stay mapped for the whole run.
+#[inline]
+fn ptr_code(s: &[u8]) -> u64 {
+    match pack_id(s) {
+        Some(v) => v,
+        None => {
+            let p = s.as_ptr() as u64;
+            assert!(p < 1 << 47 && s.len() < 1 << 16);
+            FALLBACK | (s.len() as u64) << 47 | p
+        }
+    }
+}
+fn ptr_bytes<'b>(v: u64, buf: &'b mut [u8; 10]) -> &'b [u8] {
+    if v < FALLBACK {
+        let n = unpack_id(v, buf);
+        &buf[..n]
+    } else {
+        unsafe { std::slice::from_raw_parts((v & ((1 << 47) - 1)) as *const u8, ((v >> 47) & 0xFFFF) as usize) }
+    }
+}
+/// Byte-wise a < b on click ID codes.
+fn cid_lt(a: u64, b: u64) -> bool {
+    if (a | b) < FALLBACK {
+        return a < b;
+    }
+    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    ptr_bytes(a, &mut x) < ptr_bytes(b, &mut y)
+}
+type Reg<'a> = Map<u64, &'a [u8]>;
 fn merge<'a>(reg: &mut Reg<'a>, c: Coder<'a>) {
     for (h, s) in c.fb {
         match reg.entry(h) {
@@ -233,19 +276,23 @@ fn merge<'a>(reg: &mut Reg<'a>, c: Coder<'a>) {
         }
     }
 }
-fn id_vec(v: u64, reg: &Reg) -> Vec<u8> {
+/// Bytes of a user ID code.
+fn id_bytes<'b>(v: u64, reg: &'b Reg, buf: &'b mut [u8; 10]) -> &'b [u8] {
     if v < FALLBACK {
-        let mut b = [0u8; 10];
-        let n = unpack_id(v, &mut b);
-        b[..n].to_vec()
+        let n = unpack_id(v, buf);
+        &buf[..n]
     } else {
-        reg[&v].to_vec()
+        reg[&v]
     }
 }
-/// Byte-wise a < b on ID codes.
+/// Byte-wise a < b on user ID codes.
 #[inline]
 fn id_lt(a: u64, b: u64, reg: &Reg) -> bool {
-    if (a | b) < FALLBACK { a < b } else { id_vec(a, reg) < id_vec(b, reg) }
+    if (a | b) < FALLBACK {
+        return a < b;
+    }
+    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    id_bytes(a, reg, &mut x) < id_bytes(b, reg, &mut y)
 }
 
 // ---------- tiny work-stealing thread pool ----------
@@ -696,7 +743,7 @@ fn main() {
                 if eid.is_empty() {
                     return;
                 }
-                let e = cd.code(eid);
+                let e = eq_code(eid);
                 let ing = tc.ts(ing).unwrap_or(i64::MAX);
                 let mut c = ECopy { eid: e, user: 0, ing, t: INVALID, pay: 0 };
                 if !user.is_empty() && !pr_id.is_empty() {
@@ -829,7 +876,7 @@ fn main() {
                     let Some(c) = camp_of(cmp) else { return };
                     match tc.ts(ts) {
                         Some(x) if x >= cbase && x < we => {
-                            pend.push(CkRec { p: cd.code(user), cid: cd.code(cid), t: (x - cbase) as u32, camp: c });
+                            pend.push(CkRec { p: cd.code(user), cid: ptr_code(cid), t: (x - cbase) as u32, camp: c });
                             if pend.len() == 32 {
                                 flush(pend, bufs);
                             }
@@ -1045,7 +1092,7 @@ fn main() {
                             if ck[m].t != tl {
                                 break;
                             }
-                            if id_lt(ck[m].cid, ck[bi].cid, reg) {
+                            if cid_lt(ck[m].cid, ck[bi].cid) {
                                 bi = m;
                             }
                         }
@@ -1376,7 +1423,7 @@ fn people<'a>(chunks: &[&'a [u8]], nt: usize) -> (PTable, Reg<'a>) {
             }
         });
     });
-    let mut reg: Reg = HashMap::new();
+    let mut reg: Reg = Map::default();
     let mut edges: Vec<(u64, u64)> = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
     for (e, cd) in parts {
         merge(&mut reg, cd);
