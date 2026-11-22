@@ -34,6 +34,13 @@ use std::time::Instant;
 
 const NPB: u32 = 9; // log2 of the bucket count
 const NP: usize = 1 << NPB;
+/// log2 of the person bucket count (dedup output, clicks, sweep tasks)
+const PPB: u32 = 10;
+const NPP: usize = 1 << PPB;
+#[inline]
+fn pbucket(h: u64) -> usize {
+    (h >> (64 - PPB)) as usize
+}
 /// Profiling probes: how many times to run (parse, dedup+clicks, sweep).
 /// Always (1, 1, 1) in a real build.
 const PROBE: (usize, usize, usize) = (1, 1, 1);
@@ -477,14 +484,14 @@ unsafe impl<T: Send, const NT: bool> Send for Scatter<T, NT> {}
 unsafe impl<T: Sync, const NT: bool> Sync for Scatter<T, NT> {}
 impl<T: Copy, const NT: bool> Scatter<T, NT> {
     const PER: usize = SL * 64 / std::mem::size_of::<T>();
-    fn new(items: usize) -> Self {
+    fn new(items: usize, nb: usize) -> Self {
         assert!(64 % std::mem::size_of::<T>() == 0);
         let lines = items * std::mem::size_of::<T>() / 64 + 2 * SL;
         Scatter {
-            stage: vec![[Line([0; 8]); SL]; NP],
-            fill: vec![0; NP],
-            out: (0..NP).map(|_| Vec::with_capacity(lines)).collect(),
-            n: vec![0; NP],
+            stage: vec![[Line([0; 8]); SL]; nb],
+            fill: vec![0; nb],
+            out: (0..nb).map(|_| Vec::with_capacity(lines)).collect(),
+            n: vec![0; nb],
             _t: std::marker::PhantomData,
         }
     }
@@ -532,7 +539,7 @@ impl<T: Copy, const NT: bool> Scatter<T, NT> {
     /// Moves the partly filled staged lines into place.
     fn finish(&mut self) {
         self.fence();
-        for b in 0..NP {
+        for b in 0..self.fill.len() {
             let f = self.fill[b] as usize;
             let v = &mut self.out[b];
             self.n[b] = v.len() * 64 / std::mem::size_of::<T>() + f;
@@ -551,8 +558,8 @@ impl<T, const NT: bool> std::ops::Index<usize> for Scatter<T, NT> {
     }
 }
 
-fn reserved<T>(n: usize) -> Vec<Vec<T>> {
-    (0..NP).map(|_| Vec::with_capacity(n)).collect()
+fn reserved<T>(n: usize, nb: usize) -> Vec<Vec<T>> {
+    (0..nb).map(|_| Vec::with_capacity(n)).collect()
 }
 
 // ---------- files ----------
@@ -820,6 +827,7 @@ fn main() {
     let ev_bytes: usize = ev_maps.iter().map(|m| m.len()).sum();
     let ck_bytes: usize = ck_maps.iter().map(|m| m.len()).sum();
     let per = |bytes: usize, line: usize| bytes / line / nt.max(1) / NP * 6 / 5 + 64;
+    let per_p = |bytes: usize, line: usize| bytes / line / nt.max(1) / NPP * 6 / 5 + 64;
 
     // ---- people (links -> union-find -> person codes), then events: every
     // ---- core validates copies and buckets them by hash(event_id)
@@ -847,7 +855,7 @@ fn main() {
     let ((person, link_reg), copies) = std::thread::scope(|sc| {
     let h = if overlap { Some(sc.spawn(|| ppl(()))) } else { None };
     let copies = {
-        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per), NameLog::default(), TsCache::default()), |(bufs, cd, tc), ci| {
+        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per, NP), NameLog::default(), TsCache::default()), |(bufs, cd, tc), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -911,7 +919,7 @@ fn main() {
     // ---- and scatter by hash(person). Tables and buffers are reused per thread.
     let ck_chunks = chunks(&ck_maps);
     let cbase = ws - WEEK;
-    let (evo_per, cko_per) = (per(ev_bytes, 76), per(ck_bytes, 44));
+    let (evo_per, cko_per) = (per_p(ev_bytes, 76), per_p(ck_bytes, 44));
     struct Work<'a> {
         tab: Vec<(u64, (u32, u32))>, // (eid, (index in best, generation))
         gen: u32,
@@ -925,7 +933,7 @@ fn main() {
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
+        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per, NPP), ck: reserved(cko_per, NPP), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -980,7 +988,7 @@ fn main() {
                     }
                     if c.t != INVALID && c.ing - (ws + c.t as i64) <= DAY_MS {
                         let p = person_of(c.user);
-                        st.ev.push(bucket(mix(p)), EvRec { p, t: c.t, pay: c.pay });
+                        st.ev.push(pbucket(mix(p)), EvRec { p, t: c.t, pay: c.pay });
                     }
                 }
                 st.ev.fence();
@@ -994,7 +1002,7 @@ fn main() {
                     }
                     for r in pend.iter() {
                         let p = person_of(r.p);
-                        bufs[bucket(mix(p))].push(CkRec { p, ..*r });
+                        bufs[pbucket(mix(p))].push(CkRec { p, ..*r });
                     }
                     pend.clear();
                 };
@@ -1042,12 +1050,12 @@ fn main() {
     let reg = &reg;
     // Biggest buckets first: a bucket holding a very active person can take
     // several times the average, and must not be the last one picked up.
-    let mut order: Vec<usize> = (0..NP).collect();
+    let mut order: Vec<usize> = (0..NPP).collect();
     let size = |q: usize| -> usize { evs.iter().map(|s| s[q].len()).sum::<usize>() + cks.iter().map(|s| s[q].len()).sum::<usize>() };
     order.sort_by_cached_key(|&q| std::cmp::Reverse(size(q)));
     if std::env::var_os("SS_VERBOSE").is_some() {
-        let tot: usize = (0..NP).map(size).sum();
-        eprintln!("  (buckets max {} {} {} mean {})", size(order[0]), size(order[1]), size(order[2]), tot / NP);
+        let tot: usize = (0..NPP).map(size).sum();
+        eprintln!("  (buckets max {} {} {} mean {})", size(order[0]), size(order[1]), size(order[2]), tot / NPP);
     }
     // ---- outputs: each thread writes its user_daily part as soon as it runs
     // ---- out of sweep work
@@ -1103,7 +1111,7 @@ fn main() {
 
     let run_sweep = || par_fin(
         nt,
-        NP,
+        NPP,
         || Sweep {
             cs: vec![0; w],
             cp: vec![0; w],
@@ -1338,7 +1346,7 @@ fn kind(t: &[u8]) -> u8 {
 /// Bin of a person code inside its bucket: `bits` bits just below the bucket's.
 #[inline]
 fn sub_bin(p: u64, bits: u32) -> usize {
-    (mix(p) >> (64 - NPB - bits)) as usize & ((1 << bits) - 1)
+    (mix(p) >> (64 - PPB - bits)) as usize & ((1 << bits) - 1)
 }
 
 /// Bin bits for a bucket of n records: ~4 records per bin, so a bin is
