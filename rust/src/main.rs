@@ -832,12 +832,20 @@ fn main() {
     }
     // people first, on every thread (it is random-access work that slows
     // badly when it shares the machine with the event parser)
+    // people and the event parse run at the same time: parsing needs no
+    // persons, and it fills the cores people's serial steps leave idle
     let tp = Instant::now();
-    let (person, link_reg) = people(&ln_chunks, nt);
-    if std::env::var_os("SS_VERBOSE").is_some() {
-        eprintln!("  (people {:.3}s)", tp.elapsed().as_secs_f64());
-    }
-    lap("people");
+    let overlap = std::env::var("SS_NOOVERLAP").map_or(true, |v| v.is_empty());
+    let ppl = |_: ()| {
+        let r = people(&ln_chunks, nt);
+        if std::env::var_os("SS_VERBOSE").is_some() {
+            eprintln!("  (people {:.3}s)", tp.elapsed().as_secs_f64());
+        }
+        r
+    };
+    let mut early = if overlap { None } else { Some(ppl(())) };
+    let ((person, link_reg), copies) = std::thread::scope(|sc| {
+    let h = if overlap { Some(sc.spawn(|| ppl(()))) } else { None };
     let copies = {
         let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per), NameLog::default(), TsCache::default()), |(bufs, cd, tc), ci| {
             populate(ev_chunks[ci]);
@@ -879,6 +887,13 @@ fn main() {
         }
         run()
     };
+    let pl = match h {
+        Some(h) => h.join().unwrap(),
+        None => early.take().unwrap(),
+    };
+    (pl, copies)
+    });
+    lap("people+parse");
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
     let mut logs: Vec<NameLog> = Vec::new();
@@ -889,7 +904,7 @@ fn main() {
     }
     // linked users map to their person; everyone else names themselves
     let person_of = |u: u64| person.get(u);
-    lap("parse");
+    lap("merge");
 
     // ---- one task pool: dedup each event bucket (earliest ingest wins, then
     // ---- validate + late check), and parse clicks. Both map users to people
