@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 memmap2 = "0.9"
 memchr = "2"
-parquet = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["snap"] }
 bytes = "1"
 
 [profile.release]
