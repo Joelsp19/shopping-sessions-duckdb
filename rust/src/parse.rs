@@ -121,6 +121,8 @@ pub fn masks(p: &[u8; 64]) -> (u64, u64, u64) {
 /// separators (N-1 commas, then '\n'). A field is quoted when it starts and
 /// ends with '"' (length >= 2); the line is well formed iff its quote count is
 /// exactly 2 per quoted field (any other quote makes `fields` reject it).
+const PF_AHEAD: usize = 1024;
+
 #[inline]
 pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     const NB: usize = 128;
@@ -138,6 +140,12 @@ pub fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut([&
         let mut np = 0usize;
         let mut qacc = 0u32;
         for i in 0..nb {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                // the hardware prefetcher stops at page ends; stay ahead of it
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch::<_MM_HINT_T0>(chunk.as_ptr().wrapping_add(s + i * 64 + PF_AHEAD) as *const i8);
+            }
             let blk: &[u8; 64] = bytes[i * 64..i * 64 + 64].try_into().unwrap();
             let (ms, _, mq) = masks(blk);
             qm[i] = mq;

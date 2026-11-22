@@ -316,6 +316,7 @@ struct Line([u64; 8]);
 /// stores, so the destination line is never read from memory first.
 /// T's size must divide 64. Call `finish` before reading.
 const SL: usize = 4; // staged lines per bucket
+const NTSTORE: bool = true;
 struct Scatter<T> {
     stage: Vec<[Line; SL]>,
     fill: Vec<u8>,
@@ -355,7 +356,11 @@ impl<T: Copy> Scatter<T> {
                     let src = st as *const __m256i;
                     let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
                     for k in 0..2 * SL {
-                        _mm256_stream_si256(dst.add(k), _mm256_load_si256(src.add(k)));
+                        if NTSTORE {
+                            _mm256_stream_si256(dst.add(k), _mm256_load_si256(src.add(k)));
+                        } else {
+                            _mm256_store_si256(dst.add(k), _mm256_load_si256(src.add(k)));
+                        }
                     }
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
