@@ -913,7 +913,8 @@ fn main() {
     let cbase = ws - WEEK;
     let (evo_per, cko_per) = (per(ev_bytes, 76), per(ck_bytes, 44));
     struct Work<'a> {
-        tab: Vec<(u64, u32)>,
+        tab: Vec<(u64, (u32, u32))>, // (eid, (index in best, generation))
+        gen: u32,
         best: Vec<ECopy>,
         ev: Scatter<EvRec, DEDUP_NT>,
         ck: Vec<Vec<CkRec>>,
@@ -924,7 +925,7 @@ fn main() {
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), best: Vec::new(), ev: Scatter::new(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
+        || Work { tab: Vec::new(), gen: 0, best: Vec::new(), ev: Scatter::new(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -934,8 +935,12 @@ fn main() {
                 let total: usize = ev_parts.iter().map(|w| w[dp].len()).sum();
                 let cap = (total * 2).next_power_of_two().max(16);
                 if st.tab.len() < cap {
-                    st.tab.resize(cap, (0, 0));
+                    st.tab.resize(cap, (0, (0, 0)));
                 }
+                // a slot is live only if it carries this task's generation,
+                // so the table is never cleared
+                st.gen += 1;
+                let gen = st.gen;
                 let tab = &mut st.tab[..cap];
                 let mask = cap - 1;
                 let best = &mut st.best;
@@ -947,20 +952,27 @@ fn main() {
                         if let Some(n) = src.get(k + AHEAD) {
                             prefetch(tab, mask, n.eid);
                         }
-                        let (i, f) = probe(tab, mask, c.eid);
-                        if f {
-                            let b = &mut best[tab[i].1 as usize];
+                        let mut i = mix(c.eid) as usize & mask;
+                        let found = loop {
+                            let e = unsafe { tab.get_unchecked(i) };
+                            if e.1 .1 != gen {
+                                break false;
+                            }
+                            if e.0 == c.eid {
+                                break true;
+                            }
+                            i = (i + 1) & mask;
+                        };
+                        if found {
+                            let b = &mut best[tab[i].1 .0 as usize];
                             if c.ing < b.ing {
                                 *b = *c;
                             }
                         } else {
-                            tab[i] = (c.eid, best.len() as u32);
+                            tab[i] = (c.eid, (best.len() as u32, gen));
                             best.push(*c);
                         }
                     }
-                }
-                for x in tab.iter_mut() {
-                    x.0 = 0;
                 }
                 for (k, c) in best.iter().enumerate() {
                     if let Some(n) = best.get(k + AHEAD) {
