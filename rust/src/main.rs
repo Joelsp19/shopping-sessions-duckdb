@@ -238,6 +238,54 @@ impl<'a> Coder<'a> {
         h
     }
 }
+/// User IDs seen while parsing events and clicks: long ones are only logged
+/// (a sequential append, split by the top bits of their hash); the registry
+/// is built from the logs afterwards, in parallel, one part per task.
+const LOG_PARTS: usize = 64;
+struct NameLog<'a> {
+    parts: Vec<Vec<(u64, &'a [u8])>>,
+}
+impl Default for NameLog<'_> {
+    fn default() -> Self {
+        NameLog { parts: (0..LOG_PARTS).map(|_| Vec::new()).collect() }
+    }
+}
+impl<'a> NameLog<'a> {
+    #[inline(always)]
+    fn code(&mut self, s: &'a [u8]) -> u64 {
+        match pack_id(s) {
+            Some(v) => v,
+            None => self.slow(s),
+        }
+    }
+    #[inline]
+    fn slow(&mut self, s: &'a [u8]) -> u64 {
+        let h = FALLBACK | (hash_bytes(s) >> 1);
+        unsafe { self.parts.get_unchecked_mut(((h >> 57) & 63) as usize) }.push((h, s));
+        h
+    }
+}
+/// Registry parts (part k holds the codes with (h >> 57) & 63 == k) built
+/// from all logs on all threads.
+fn build_parts<'a>(logs: &[NameLog<'a>], nt: usize) -> Vec<Map<u64, &'a [u8]>> {
+    let mut out: Vec<Option<Map<u64, &'a [u8]>>> = (0..LOG_PARTS).map(|_| None).collect();
+    let built = par(nt, LOG_PARTS, || Vec::new(), |acc: &mut Vec<(usize, Map<u64, &'a [u8]>)>, k| {
+        let mut m: Map<u64, &'a [u8]> = Map::default();
+        for l in logs {
+            for &(h, s) in &l.parts[k] {
+                m.entry(h).or_insert(s);
+            }
+        }
+        acc.push((k, m));
+    });
+    for v in built {
+        for (k, m) in v {
+            out[k] = Some(m);
+        }
+    }
+    out.into_iter().map(|m| m.unwrap_or_default()).collect()
+}
+
 /// An ID compared only for equality (event IDs): no registry.
 #[inline]
 fn eq_code(s: &[u8]) -> u64 {
@@ -280,15 +328,21 @@ fn cid_lt(a: u64, b: u64) -> bool {
 #[derive(Default)]
 struct Reg<'a> {
     maps: Vec<Map<u64, &'a [u8]>>,
+    parts: Vec<Map<u64, &'a [u8]>>,
 }
 impl<'a> Reg<'a> {
     fn is_empty(&self) -> bool {
-        self.maps.iter().all(|m| m.is_empty())
+        self.maps.iter().all(|m| m.is_empty()) && self.parts.iter().all(|m| m.is_empty())
     }
 }
 impl<'a> std::ops::Index<&u64> for Reg<'a> {
     type Output = &'a [u8];
     fn index(&self, h: &u64) -> &&'a [u8] {
+        if let Some(m) = self.parts.get(((h >> 57) & 63) as usize) {
+            if let Some(s) = m.get(h) {
+                return s;
+            }
+        }
         for m in &self.maps {
             if let Some(s) = m.get(h) {
                 return s;
@@ -763,7 +817,7 @@ fn main() {
     }
     lap("people");
     let copies = {
-        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per), Coder::default(), TsCache::default()), |(bufs, cd, tc), ci| {
+        let run = || par(nt, ev_chunks.len(), || (Scatter::<ECopy>::new(ev_per), NameLog::default(), TsCache::default()), |(bufs, cd, tc), ci| {
             populate(ev_chunks[ci]);
             for_each_record::<7>(ev_chunks[ci], #[inline(always)] |[eid, user, ts, ing, ty, pr_id, pr]| {
                 if eid.is_empty() {
@@ -805,8 +859,9 @@ fn main() {
     };
     let mut reg: Reg = link_reg;
     let mut ev_parts = Vec::with_capacity(copies.len());
-    for (mut b, cd, _) in copies {
-        merge(&mut reg, cd);
+    let mut logs: Vec<NameLog> = Vec::new();
+    for (mut b, lg, _) in copies {
+        logs.push(lg);
         b.finish();
         ev_parts.push(b);
     }
@@ -826,13 +881,13 @@ fn main() {
         ev: Scatter<EvRec, DEDUP_NT>,
         ck: Vec<Vec<CkRec>>,
         pend: Vec<CkRec>,
-        cd: Coder<'a>,
+        cd: NameLog<'a>,
         tc: TsCache,
     }
     let run_dedup = || par(
         nt,
         NP + ck_chunks.len(),
-        || Work { tab: Vec::new(), best: Vec::new(), ev: Scatter::new(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: Coder::default(), tc: TsCache::default() },
+        || Work { tab: Vec::new(), best: Vec::new(), ev: Scatter::new(evo_per), ck: reserved(cko_per), pend: Vec::with_capacity(32), cd: NameLog::default(), tc: TsCache::default() },
         |st, task| {
             // click chunks first: each is several times a dedup bucket's work,
             // and must not be what the last threads are still doing
@@ -923,12 +978,14 @@ fn main() {
     let mut evs = Vec::with_capacity(work.len());
     let mut cks = Vec::with_capacity(work.len());
     for wk in work {
-        merge(&mut reg, wk.cd);
+        logs.push(wk.cd);
         let mut e = wk.ev;
         e.finish();
         evs.push(e);
         cks.push(wk.ck);
     }
+    reg.parts = build_parts(&logs, nt);
+    std::mem::forget(logs); // freed at exit
     lap("dedup+ck");
 
     // ---- per person sweep: sessions, user_daily, credit, assists
